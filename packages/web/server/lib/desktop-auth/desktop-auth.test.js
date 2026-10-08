@@ -375,16 +375,18 @@ describe('desktop google loopback', () => {
     const h = createHarness({ serviceImpl: configService() });
     const { requestId } = await startOk(h);
     const callsBefore = h.serviceCalls.length;
-    for (const [query, status] of [
-      [{}, 400],
-      [{ state: 'nope', code: 'x' }, 400],
-      [{ state: requestId }, 400],
-      [{ state: requestId, code: 'x', error: 'access_denied' }, 400],
-      [{ state: 'b'.repeat(32), code: 'x' }, 410],
+    for (const [query, status, step, code] of [
+      [{}, 400, 'callback', 'invalid_request'],
+      [{ state: 'nope', code: 'x' }, 400, 'callback', 'invalid_request'],
+      [{ state: requestId }, 400, 'callback', 'invalid_request'],
+      [{ state: requestId, code: 'x', error: 'access_denied' }, 400, 'google', 'google_oauth_error'],
+      [{ state: 'b'.repeat(32), code: 'x' }, 410, 'callback', 'invalid_state'],
     ]) {
       const { res } = await h.call('GET', '/auth/desktop-google/callback', { query });
       expect(res.statusCode).toBe(status);
       expect(res.text).toContain('Sign in with Google');
+      expect(res.text).toContain(`data-auth-error="${code}"`);
+      expect(res.text).toContain(`${step} · ${code}`);
     }
     expect(h.serviceCalls).toHaveLength(callsBefore);
   });
@@ -435,11 +437,64 @@ describe('desktop google loopback', () => {
     expect(h.serviceCalls).toHaveLength(callsBefore);
   });
 
-  test('maps a refused exchange to the failure page and drops the request', async () => {
-    for (const [serviceStatus, serviceBody, pageStatus] of [
-      [401, { error: 'invalid_google_credential' }, 401],
-      [409, { error: 'identity_conflict' }, 409],
-      [503, { error: 'google_not_configured' }, 503],
+  test('pre-callback polls retain the pending login until the callback lands', async () => {
+    // Regression: the renderer polls every 2 s while the user is still
+    // inside Google's dance, so polls arrive before the loopback callback.
+    // Those still-waiting polls must answer 404 WITHOUT consuming the
+    // single-use entry, or the later callback always misses (invalid_state).
+    const seen = [];
+    const h = createHarness({ serviceImpl: exchangeService(seen) });
+    const { requestId } = await startOk(h);
+    const callsBefore = h.serviceCalls.length;
+
+    for (let poll = 0; poll < 2; poll += 1) {
+      const waiting = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+      expect(waiting.res.statusCode).toBe(404);
+      expect(waiting.res.body).toEqual({ error: 'no_credential' });
+    }
+    expect(h.serviceCalls).toHaveLength(callsBefore);
+
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(200);
+    expect(landed.res.text).toContain('return to the OpenChamber app');
+    expect(seen).toHaveLength(1);
+
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+
+    const replay = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(replay.res.statusCode).toBe(404);
+    expect(replay.res.body).toEqual({ error: 'no_credential' });
+    expect(h.seenSessions).toHaveLength(1);
+  });
+
+  test('expired and consumed logins fail closed with named errors', async () => {
+    const seen = [];
+    const h = createHarness({ serviceImpl: exchangeService(seen) });
+    const { requestId } = await startOk(h);
+    h.runtime._pendingGoogle.get(requestId).expiresAt = Date.now() - 1;
+
+    const gone = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(gone.res.statusCode).toBe(404);
+    expect(gone.res.body).toEqual({ error: 'no_credential' });
+
+    const late = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(late.res.statusCode).toBe(410);
+    expect(late.res.text).toContain('callback · invalid_state');
+    expect(seen).toHaveLength(0);
+    expect(h.seenSessions).toHaveLength(0);
+  });
+
+  test('maps a refused exchange to a named failure the poll reads once', async () => {
+    for (const [serviceStatus, serviceBody, pageStatus, code] of [
+      [401, { error: 'invalid_google_credential' }, 401, 'invalid_google_credential'],
+      [409, { error: 'identity_conflict' }, 409, 'identity_conflict'],
+      [503, { error: 'google_not_configured' }, 503, 'google_not_configured'],
     ]) {
       const h = createHarness({
         serviceImpl: async (url) => {
@@ -453,10 +508,47 @@ describe('desktop google loopback', () => {
       });
       expect(landed.res.statusCode).toBe(pageStatus);
       expect(landed.res.text).toContain('Sign in with Google');
-      const { res } = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
-      expect(res.statusCode).toBe(404);
+      expect(landed.res.text).toContain(`data-auth-error="${code}"`);
+      expect(landed.res.text).toContain(`exchange · ${code}`);
+      // A repeat navigation re-renders the same named page, no second exchange.
+      const again = await h.call('GET', '/auth/desktop-google/callback', {
+        query: { state: requestId, code: 'loopback-code' },
+      });
+      expect(again.res.statusCode).toBe(pageStatus);
+      expect(again.res.text).toContain(`exchange · ${code}`);
+      // The app poll reads the terminal failure once, then waits again.
+      const failed = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+      expect(failed.res.statusCode).toBe(pageStatus);
+      expect(failed.res.body).toEqual({ error: code, step: 'exchange' });
       expect(h.seenSessions).toHaveLength(0);
+      const after = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+      expect(after.res.statusCode).toBe(404);
+      expect(after.res.body).toEqual({ error: 'no_credential' });
     }
+  });
+
+  test('names a missing desktop-code endpoint instead of blaming the credential', async () => {
+    // The deployed service predates POST /auth/google/desktop-code: it
+    // answers 404 with a non-JSON body. The callback must name the
+    // endpoint gap (step exchange, service 404), not invalid credentials.
+    const h = createHarness({
+      serviceImpl: async (url) => {
+        if (url.endsWith('/auth/google/config')) return h.serviceJson(200, { clientId: 'google-client-123' });
+        return { status: 404, json: async () => { throw new Error('not json'); } };
+      },
+    });
+    const { requestId } = await startOk(h);
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(502);
+    expect(landed.res.text).toContain('data-auth-error="desktop_code_unavailable"');
+    expect(landed.res.text).toContain('exchange · desktop_code_unavailable');
+    expect(landed.res.text).toContain('service 404');
+    const failed = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(failed.res.statusCode).toBe(502);
+    expect(failed.res.body).toEqual({ error: 'desktop_code_unavailable', step: 'exchange' });
+    expect(h.seenSessions).toHaveLength(0);
   });
 
   test('answers an unreachable service at the callback without a session', async () => {
@@ -471,8 +563,35 @@ describe('desktop google loopback', () => {
       query: { state: requestId, code: 'loopback-code' },
     });
     expect(landed.res.statusCode).toBe(502);
-    const { res } = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
-    expect(res.statusCode).toBe(404);
+    expect(landed.res.text).toContain('data-auth-error="upstream_unavailable"');
+    expect(landed.res.text).toContain('exchange · upstream_unavailable');
+    const failed = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(failed.res.statusCode).toBe(502);
+    expect(failed.res.body).toEqual({ error: 'upstream_unavailable', step: 'exchange' });
+    expect(h.seenSessions).toHaveLength(0);
+  });
+
+  test('rejects hostile callback input with named errors and no markup echo', async () => {
+    const h = createHarness({ serviceImpl: configService() });
+    const { requestId } = await startOk(h);
+    const callsBefore = h.serviceCalls.length;
+    const oversized = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: `${'c'.repeat(2048)}x` },
+    });
+    expect(oversized.res.statusCode).toBe(400);
+    expect(oversized.res.text).toContain('callback · invalid_request');
+    const arrayState = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: [requestId], code: 'x' },
+    });
+    expect(arrayState.res.statusCode).toBe(400);
+    expect(arrayState.res.text).toContain('callback · invalid_request');
+    const hostile = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'x', error: '"><script>alert(1)</script>' },
+    });
+    expect(hostile.res.statusCode).toBe(400);
+    expect(hostile.res.text).toContain('google · google_oauth_error');
+    expect(hostile.res.text).not.toContain('<script>');
+    expect(h.serviceCalls).toHaveLength(callsBefore);
   });
 
   test('completes without a local secret via service introspection', async () => {

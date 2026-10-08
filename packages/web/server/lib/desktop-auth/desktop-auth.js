@@ -63,6 +63,9 @@ const nonEmptyStringSchema = z.string().min(1);
 // Service and browser payloads are parsed with these schemas at their
 // boundaries instead of ad-hoc type narrowing.
 const servicePairSchema = z.object({ access_token: nonEmptyStringSchema });
+// Upstream error codes are named, not free text: only codes matching the
+// service's own machine-code shape pass through to the failure page.
+const serviceErrorSchema = z.object({ error: z.string().regex(/^[A-Za-z0-9_]{1,64}$/) });
 const serviceMeSchema = z.object({ id: nonEmptyStringSchema });
 const tokenSidSchema = z.object({ sid: z.string() });
 const desktopCallbackQuerySchema = z.object({
@@ -333,29 +336,69 @@ export const createDesktopAuthRuntime = ({
     true,
   );
 
-  const callbackFailurePage = (status) => {
-    if (status === 503) {
-      return callbackPage(
-        'Sign-in unavailable',
-        'Sign in with Google',
-        'Google login is not configured right now. Close this tab and try again later.',
-        false,
-      );
+  const escHtml = (value) => String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  // Named loopback-callback failure page. Every failure names the failing
+  // step and the upstream error code twice: in body[data-auth-error] (the
+  // machine hook, same contract as the service's googleFail pages) and in
+  // a visible <code> line — a did-not-complete page never stays silent
+  // about where it failed. `detail` carries short upstream context (the
+  // provider's error value or the service HTTP status); always escaped.
+  const callbackFailurePage = (status, { step, code, detail }) => {
+    const copy = status === 502 || status === 503
+      ? { title: 'Sign-in unavailable', message: 'Google login is not available right now. Close this tab and try again later.' }
+      : status === 409
+        ? { title: 'Sign-in conflict', message: 'This Google account is linked to a different sign-in. Close this tab and try another account.' }
+        : { title: 'Sign-in failed', message: 'Google sign-in did not complete. Close this tab and restart Google login from the app.' };
+    const detailLine = detail === '' ? '' : `<p><code>${escHtml(detail)}</code></p>`;
+    return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${copy.title} — OpenChamber</title>
+<style>body{font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;background:#131110;color:#fafaf9}.card{text-align:center;max-width:24rem;padding:2rem}p{color:#a8a29e}code{color:#e7e5e4}</style>
+</head>
+<body data-auth-error="${escHtml(code)}"><div class="card">
+<h1>Sign in with Google</h1>
+<p>${copy.message}</p>
+<p><code>${escHtml(step)} \u00b7 ${escHtml(code)}</code></p>
+${detailLine}
+</div></body></html>`;
+  };
+
+  // Map a failed POST /auth/google/desktop-code exchange to a named
+  // failure. A 404 or non-JSON answer means the service where the app
+  // points has no desktop-code endpoint (deployment predates it): that is
+  // reported as desktop_code_unavailable, never as a generic credential
+  // failure. Known service error codes pass through; anything else reads
+  // as an invalid credential, matching the service's own fail-closed shape.
+  const exchangeFailureOf = (exchange) => {
+    const data = exchange.data;
+    if (exchange.status === 404 || data === null) {
+      return {
+        step: 'exchange', code: 'desktop_code_unavailable', status: 502, detail: `service ${exchange.status}`,
+      };
     }
-    if (status === 409) {
-      return callbackPage(
-        'Sign-in conflict',
-        'Sign in with Google',
-        'This Google account is linked to a different sign-in. Close this tab and try another account.',
-        false,
-      );
+    const parsedServiceError = serviceErrorSchema.safeParse(data);
+    const serviceCode = parsedServiceError.success ? parsedServiceError.data.error : '';
+    if (exchange.status === 503 || serviceCode === 'google_not_configured') {
+      return { step: 'exchange', code: 'google_not_configured', status: 503, detail: '' };
     }
-    return callbackPage(
-      'Sign-in failed',
-      'Sign in with Google',
-      'Google sign-in did not complete. Close this tab and restart Google login from the app.',
-      false,
-    );
+    if (exchange.status === 409 || serviceCode === 'identity_conflict') {
+      return { step: 'exchange', code: 'identity_conflict', status: 409, detail: '' };
+    }
+    if (exchange.status === 429) {
+      return {
+        step: 'exchange', code: 'upstream_unavailable', status: 502, detail: `service ${exchange.status}`,
+      };
+    }
+    return {
+      step: 'exchange', code: serviceCode === '' ? 'invalid_google_credential' : serviceCode, status: 401, detail: '',
+    };
   };
 
   const registerRoutes = ({ get, post }, { express, tunnelAuthController }) => {
@@ -449,6 +492,7 @@ export const createDesktopAuthRuntime = ({
         nonce,
         redirectUri,
         pair: null,
+        failure: null,
         expiresAt: now() + GOOGLE_REQUEST_TTL_MS,
       });
       const params = new URLSearchParams({
@@ -471,27 +515,36 @@ export const createDesktopAuthRuntime = ({
     // service where the secret lives, and holds the pair for the app poll.
     // Stays public like the page it replaces — the system browser sends no
     // auth headers, and unknown states fail closed before any exchange.
+    // Exchange failures are RETAINED on the pending entry (never deleted)
+    // with their named step+code: the page names them, a repeat navigation
+    // re-renders the same page, and the app poll reads the failure once
+    // instead of waiting on 404 until the request expires.
     get('/auth/desktop-google/callback', async (req, res) => {
+      const fail = (status, failure) => {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(status).send(callbackFailurePage(status, failure));
+      };
       const parsedQuery = desktopCallbackQuerySchema.safeParse(req?.query ?? {});
       const state = parsedQuery.success ? parsedQuery.data.state : '';
       const code = parsedQuery.success && parsedQuery.data.code !== undefined ? parsedQuery.data.code : '';
       const googleError = parsedQuery.success && parsedQuery.data.error !== undefined ? parsedQuery.data.error : '';
       if (googleError !== '') {
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(400).send(callbackFailurePage(401));
+        return fail(400, {
+          step: 'google', code: 'google_oauth_error', detail: googleError.slice(0, 64),
+        });
       }
       if (!requestIdSchema.safeParse(state).success || code === '' || code.length > 2048) {
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(400).send(callbackFailurePage(401));
+        return fail(400, { step: 'callback', code: 'invalid_request', detail: '' });
       }
       sweepGoogle();
       const pending = pendingGoogle.get(state);
       if (!pending) {
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(410).send(callbackFailurePage(401));
+        return fail(410, { step: 'callback', code: 'invalid_state', detail: '' });
+      }
+      if (pending.failure !== null && pending.failure !== undefined) {
+        // Repeat navigation after a failed exchange: the same named page.
+        return fail(pending.failure.status, pending.failure);
       }
       if (pending.pair !== null) {
         // Double navigation after a captured code: idempotent success.
@@ -508,21 +561,16 @@ export const createDesktopAuthRuntime = ({
           nonce: pending.nonce,
         });
       } catch {
-        pendingGoogle.delete(state);
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(502).send(callbackFailurePage(503));
+        pending.failure = { step: 'exchange', code: 'upstream_unavailable', status: 502, detail: '' };
+        return fail(502, pending.failure);
       }
       const parsedToken = exchange.status === 200
         ? servicePairSchema.safeParse(exchange.data)
         : null;
       const accessToken = parsedToken && parsedToken.success ? parsedToken.data.access_token.trim() : '';
       if (accessToken === '') {
-        pendingGoogle.delete(state);
-        const pageStatus = exchange.status === 503 ? 503 : exchange.status === 409 ? 409 : 401;
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(pageStatus).send(callbackFailurePage(pageStatus));
+        pending.failure = exchangeFailureOf(exchange);
+        return fail(pending.failure.status, pending.failure);
       }
       pending.pair = accessToken;
       res.setHeader('Cache-Control', 'no-store');
@@ -536,12 +584,22 @@ export const createDesktopAuthRuntime = ({
       if (!parsed.success) return badRequest(res, 'invalid_request');
       sweepGoogle();
       const pending = pendingGoogle.get(parsed.data.requestId);
-      // Single-use: consume before issuing so a replay races nothing.
-      if (pending) pendingGoogle.delete(parsed.data.requestId);
+      if (pending?.failure !== undefined && pending?.failure !== null) {
+        // Terminal: the callback already failed with a named step+code.
+        // Hand it to the app at once instead of polling 404 until the
+        // request expires. Single-use: consume before answering.
+        pendingGoogle.delete(parsed.data.requestId);
+        return res.status(pending.failure.status).json({ error: pending.failure.code, step: pending.failure.step });
+      }
       const parsedPair = servicePairSchema.safeParse({ access_token: pending?.pair });
       if (!pending || !parsedPair.success || parsedPair.data.access_token.trim() === '') {
+        // Still waiting (or unknown/consumed/expired): answer 404 WITHOUT
+        // consuming, so pre-callback polls never orphan the pending login
+        // the loopback callback is about to present.
         return res.status(404).json({ error: 'no_credential' });
       }
+      // Single-use: consume before issuing so a replay races nothing.
+      pendingGoogle.delete(parsed.data.requestId);
       return completeWithServicePair(req, res, { access_token: parsedPair.data.access_token.trim() }, sessionOptsOf(parsed.data));
     });
   };
