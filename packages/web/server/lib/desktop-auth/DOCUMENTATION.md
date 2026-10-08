@@ -45,6 +45,20 @@ TTL, single use). The app polls `/api/auth/desktop/google-complete`, which
 converts the pair into a session like email. The renderer never sees the
 code, verifier, or pair.
 
+Callback failures are named, never silent: the failure page carries the
+failing step and upstream code in `body[data-auth-error]` and in a visible
+`<code>step · code</code>` line. Steps are `google` (Google refused, e.g.
+access_denied), `callback` (malformed/unknown state), and `exchange` (the
+service call failed). Exchange codes: `upstream_unavailable` (service
+unreachable/throttled), `desktop_code_unavailable` (service answered 404 or
+non-JSON — the deployment where the app points has no desktop-code endpoint),
+plus the service's own `google_not_configured` / `identity_conflict` /
+credential codes passed through. A failed exchange is RETAINED on the pending
+entry until its TTL: a repeat callback navigation re-renders the same named
+page, and the app poll reads the terminal failure once
+(`{ error, step }` with the page status) instead of polling 404
+`no_credential` until expiry. Only a still-waiting request answers 404.
+
 Completion requires proving the service pair: servers with the shared
 `ALCORE_JWT_SECRET`/`JWT_SECRET` verify locally; servers without one
 (packaged desktop) confirm the pair live against the service itself
@@ -62,5 +76,8 @@ unconfirming service fails closed — never a session.
   injected in tests. Tunnel-scope requests get the neighbouring 403s; the
   config GET and loopback callback stay public (the system browser sends no
   auth headers, and unknown callback states fail closed before any
-  exchange). The loopback redirect URI is derived from the request Host and
-  normalized to `http://127.0.0.1:<port>/auth/desktop-google/callback`.
+  exchange). The loopback redirect URI is the fixed registered URI
+  `http://127.0.0.1:57123/auth/desktop-google/callback` in all modes — the
+  request Host never influences it, so the authorize URL always matches the
+  registered redirect exactly. The desktop server always binds port 57123
+  and fails loudly at startup when it is occupied.

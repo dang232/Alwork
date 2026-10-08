@@ -33,6 +33,12 @@ const GOOGLE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const GOOGLE_CLIENT_CACHE_TTL_MS = 10 * 60 * 1000;
 const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const DESKTOP_GOOGLE_CALLBACK_PATH = '/auth/desktop-google/callback';
+// Fixed loopback port the desktop server always binds (loud startup failure
+// when occupied). Google only redirects to the exact registered URI, so the
+// authorize URL carries this constant in all modes — the serving port never
+// influences it.
+const DESKTOP_PORT = 57123;
+const DESKTOP_GOOGLE_REDIRECT_URI = `http://127.0.0.1:${DESKTOP_PORT}${DESKTOP_GOOGLE_CALLBACK_PATH}`;
 const JSON_BODY_LIMIT = '64kb';
 
 const defaultServiceBase = () => {
@@ -289,34 +295,6 @@ export const createDesktopAuthRuntime = ({
     return { verifier, challenge };
   };
 
-  const readRequestHost = (req) => {
-    const candidates = [];
-    try {
-      candidates.push(req?.get?.('host'));
-    } catch {
-      candidates.push(undefined);
-    }
-    candidates.push(req?.headers?.host, req?.headers?.[':authority']);
-    for (const candidate of candidates) {
-      const parsed = z.string().min(1).safeParse(candidate);
-      if (parsed.success) {
-        const trimmed = parsed.data.trim();
-        if (trimmed !== '') return trimmed;
-      }
-    }
-    return '';
-  };
-
-  // The loopback redirect target for THIS server, derived from the request's
-  // own Host (the port is dynamic per launch). Only loopback hosts qualify
-  // and the result is always normalized to 127.0.0.1, so this URL can never
-  // become an open redirector and always matches the service allowlist.
-  const resolveLoopbackRedirectUri = (req) => {
-    const match = /^(localhost|127\.0\.0\.1|\[::1\])(:(\d{1,5}))?$/.exec(readRequestHost(req));
-    const port = match?.[3] !== undefined ? Number(match[3]) : NaN;
-    if (!match || !Number.isInteger(port) || port < 1 || port > 65535) return null;
-    return `http://127.0.0.1:${port}${DESKTOP_GOOGLE_CALLBACK_PATH}`;
-  };
 
   const callbackPage = (title, heading, message, done) => `<!doctype html>
 <html lang="en">
@@ -479,10 +457,10 @@ ${detailLine}
       if (clientId === '') {
         return res.status(503).json({ error: 'google_not_configured' });
       }
-      const redirectUri = resolveLoopbackRedirectUri(req);
-      if (redirectUri === null) {
-        return res.status(500).json({ error: 'internal' });
-      }
+      // Pinned to the registered Google callback URI in all modes: the
+      // request Host (dynamic per launch) never influences it, so the
+      // authorize URL always matches the registered redirect exactly.
+      const redirectUri = DESKTOP_GOOGLE_REDIRECT_URI;
       sweepGoogle();
       const requestId = randomBytes(16).toString('hex');
       const { verifier, challenge } = mintPkce();

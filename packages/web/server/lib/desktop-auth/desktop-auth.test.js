@@ -362,13 +362,54 @@ describe('desktop google loopback', () => {
     expect(res.body).toEqual({ error: 'google_not_configured' });
   });
 
-  test('refuses non-loopback and missing hosts instead of minting a redirect', async () => {
-    const h = createHarness({ serviceImpl: configService() });
-    for (const headers of [{ host: 'example.com:443' }, { host: '' }, { host: undefined }]) {
-      const { res } = await h.call('POST', '/api/auth/desktop/google/start', { body: {}, headers });
-      expect(res.statusCode).toBe(500);
+  test('always mints the registered redirect URI even when the serving port differs', async () => {
+    // Regression: the authorize URL must carry exactly the registered fixed
+    // URI regardless of which port serves the UI, or Google answers 400
+    // redirect_uri_mismatch. PKCE/state/nonce behavior is unchanged.
+    const seen = [];
+    const h = createHarness({ serviceImpl: exchangeService(seen) });
+    for (const headers of [
+      { host: '127.0.0.1:57123' },
+      { host: '127.0.0.1:3901' },
+      { host: '127.0.0.1:5173' },
+      { host: 'localhost:59999' },
+      { host: '[::1]:57123' },
+      { host: 'example.com:443' },
+      { host: '' },
+    ]) {
+      const started = await h.call('POST', '/api/auth/desktop/google/start', { body: {}, headers });
+      expect(started.res.statusCode).toBe(200);
+      const parsed = new URL(started.res.body.googleUrl);
+      expect(parsed.searchParams.get('redirect_uri')).toBe(LOOPBACK_REDIRECT);
+      expect(started.res.body.requestId).toMatch(/^[0-9a-f]{32}$/);
+      expect(parsed.searchParams.get('state')).toBe(started.res.body.requestId);
+      expect(parsed.searchParams.get('code_challenge_method')).toBe('S256');
+      expect(parsed.searchParams.get('code_challenge') ?? '').toMatch(/^[A-Za-z0-9-_]{43}$/);
+      expect(parsed.searchParams.get('nonce') ?? '').toMatch(/^[0-9a-f]{32}$/);
     }
-    expect(h.serviceCalls).toHaveLength(1);
+  });
+
+  test('completes into a session when started from a mismatched serving port', async () => {
+    const seen = [];
+    const h = createHarness({ serviceImpl: exchangeService(seen) });
+    const started = await h.call('POST', '/api/auth/desktop/google/start', {
+      body: {},
+      headers: { host: '127.0.0.1:3901' },
+    });
+    expect(started.res.statusCode).toBe(200);
+    const { requestId, googleUrl } = started.res.body;
+    expect(new URL(googleUrl).searchParams.get('redirect_uri')).toBe(LOOPBACK_REDIRECT);
+
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].redirect_uri).toBe(LOOPBACK_REDIRECT);
+
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    expect(done.res.body).toMatchObject({ authenticated: true });
   });
 
   test('rejects malformed, declined, and unknown callbacks without exchanging', async () => {
