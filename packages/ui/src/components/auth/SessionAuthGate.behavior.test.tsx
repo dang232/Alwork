@@ -36,6 +36,10 @@ const resetHarness = () => {
   runtimeKey = 'local';
   runtimeEndpointChangedListener = null;
   desktopInvoke = async () => null;
+  desktopInvokeCalls = 0;
+  desktopConfigGoogle = false;
+  desktopEmailLoginOk = false;
+  desktopEmailLoginHold = false;
   desktopHostsGetCalls = 0;
   desktopHostsSetCalls = 0;
   runtimeSwitchCalls = 0;
@@ -194,6 +198,10 @@ const reactJsxRuntime = {
 let desktopShell = false;
 let runtimeFetchRejects = true;
 let sessionStatusOk = false;
+let desktopConfigGoogle = false;
+let desktopEmailLoginOk = false;
+let desktopEmailLoginHold = false;
+let finishEmailLogin: () => void = () => undefined;
 let homeReady = true;
 let ensureHomeCalls = 0;
 let homeResolutionHangs = false;
@@ -202,6 +210,7 @@ let runtimeApiBaseUrl = '';
 let runtimeKey = 'local';
 let runtimeEndpointChangedListener: (() => void) | null = null;
 let desktopInvoke: () => Promise<unknown> = async () => null;
+let desktopInvokeCalls = 0;
 let desktopHostsGetCalls = 0;
 let desktopHostsSetCalls = 0;
 let runtimeSwitchCalls = 0;
@@ -220,7 +229,7 @@ mock.module('@simplewebauthn/browser', () => ({
 }));
 
 mock.module('@/components/ui/button', () => ({
-  Button: ({ children }: { children?: unknown }) => children ?? null,
+  Button: (props: JSXProps) => ({ type: 'button-mock', props }),
 }));
 
 mock.module('@/components/ui/checkbox', () => ({
@@ -256,7 +265,10 @@ mock.module('@/lib/i18n', () => ({
 }));
 
 mock.module('@/lib/desktop', () => ({
-  invokeDesktop: () => desktopInvoke(),
+  invokeDesktop: () => {
+    desktopInvokeCalls += 1;
+    return desktopInvoke();
+  },
   isDesktopShell: mock(() => desktopShell),
   isVSCodeRuntime: mock(() => false),
 }));
@@ -271,9 +283,29 @@ mock.module('@/lib/directoryPersistence', () => ({
 }));
 
 mock.module('@/lib/runtime-fetch', () => ({
-  runtimeFetch: mock(async () => {
+  runtimeFetch: mock(async (url: string) => {
     if (runtimeFetchRejects) {
       throw new Error('offline');
+    }
+    if (url.includes('/api/auth/desktop/config')) {
+      return new Response(JSON.stringify({ googleConfigured: desktopConfigGoogle }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.includes('/api/auth/desktop/email/login')) {
+      if (desktopEmailLoginHold) {
+        return new Promise<Response>((resolve) => {
+          finishEmailLogin = () => resolve(new Response(
+            JSON.stringify({ authenticated: true, clientToken: 'client-t' }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ));
+        });
+      }
+      return new Response(
+        JSON.stringify(desktopEmailLoginOk ? { authenticated: true, clientToken: 'client-t' } : { error: 'invalid' }),
+        { status: desktopEmailLoginOk ? 200 : 401, headers: { 'content-type': 'application/json' } },
+      );
     }
 
     return new Response(JSON.stringify({ authenticated: sessionStatusOk }), {
@@ -390,6 +422,23 @@ const collectText = (node: unknown): string => {
   return '';
 };
 
+const findAllElements = (node: unknown, type: string, found: Array<{ type: string; props: JSXProps }> = []): Array<{ type: string; props: JSXProps }> => {
+  if (Array.isArray(node)) {
+    for (const child of node) findAllElements(child, type, found);
+    return found;
+  }
+  if (!node || typeof node !== 'object') return found;
+  const element = node as { type?: unknown; props?: JSXProps };
+  if (element.type === type && element.props) found.push({ type, props: element.props });
+  const children = element.props?.children;
+  if (Array.isArray(children)) {
+    for (const child of children) findAllElements(child, type, found);
+  } else {
+    findAllElements(children, type, found);
+  }
+  return found;
+};
+
 const findElement = (node: unknown, type: string): { type: string; props: JSXProps } | null => {
   if (!node || typeof node !== 'object') return null;
   const element = node as { type?: unknown; props?: JSXProps };
@@ -415,10 +464,10 @@ describe('SessionAuthGate status-check failure behavior', () => {
     const text = collectText(tree);
 
     expect(text).toContain('sessionAuth.error.networkTitle');
-    expect(text).not.toContain('sessionAuth.locked.alcoreTitle');
+    expect(text).not.toContain('sessionAuth.signin.title');
   });
 
-  test('keeps desktop-shell status-check rejection on the error screen, never a guessed Alcore login prompt', async () => {
+  test('keeps desktop-shell status-check rejection on the error screen, never a guessed sign-in form', async () => {
     resetHarness();
     desktopShell = true;
     runtimeFetchRejects = true;
@@ -427,7 +476,7 @@ describe('SessionAuthGate status-check failure behavior', () => {
     const text = collectText(tree);
 
     expect(text).toContain('sessionAuth.error.networkTitle');
-    expect(text).not.toContain('sessionAuth.locked.alcoreTitle');
+    expect(text).not.toContain('sessionAuth.signin.title');
     // A network failure says nothing about the server, so the desktop error
     // screen keeps its real escape hatches: retry and the host switcher.
     expect(text).toContain('host-switcher');
@@ -495,33 +544,92 @@ describe('SessionAuthGate status-check failure behavior', () => {
     expect(collectText(await renderGate())).toContain('child');
   });
 
-  test('discards an Alcore-token completion after switching to another host', async () => {
+  test('shows the email sign-in form with no token field', async () => {
+    resetHarness();
+    desktopShell = true;
+    runtimeFetchRejects = false;
+    desktopConfigGoogle = false;
+    sessionStatusOk = false;
+
+    const text = collectText(await renderGate());
+    expect(text).toContain('sessionAuth.signin.title');
+    expect(text).toContain('sessionAuth.signin.continue');
+    expect(text).not.toContain('sessionAuth.alcoreToken.placeholder');
+  });
+
+  test('shows the Google button when the server reports it, hidden otherwise', async () => {
+    resetHarness();
+    desktopShell = true;
+    runtimeFetchRejects = false;
+    sessionStatusOk = false;
+
+    desktopConfigGoogle = false;
+    await renderGate();
+    expect(collectText(await renderGate())).not.toContain('sessionAuth.signin.googleButton');
+
+    resetHarness();
+    desktopShell = true;
+    runtimeFetchRejects = false;
+    sessionStatusOk = false;
+    desktopConfigGoogle = true;
+    await renderGate();
+    expect(collectText(await renderGate())).toContain('sessionAuth.signin.googleButton');
+  });
+
+  test('starts the system-browser Google flow from the desktop button', async () => {
+    resetHarness();
+    desktopShell = true;
+    runtimeFetchRejects = false;
+    sessionStatusOk = false;
+    desktopConfigGoogle = true;
+    desktopInvoke = async () => ({ requestId: 'r'.repeat(32) });
+
+    await renderGate();
+    const tree = await renderGate();
+    const buttons = findAllElements(tree, 'button-mock');
+    const google = buttons.find((button) => typeof button.props.onClick === 'function');
+    expect(google).toBeTruthy();
+    await (google?.props.onClick as () => Promise<void>)();
+    await flushEffects();
+    await flushEffects();
+    expect(desktopInvokeCalls).toBe(1);
+  });
+
+  test('discards an email-login completion after switching to another host', async () => {
     resetHarness();
     desktopShell = true;
     runtimeFetchRejects = false;
     runtimeApiBaseUrl = 'https://host-a.example';
     runtimeKey = 'host:a';
-    let resolveLogin: (value: unknown) => void = () => {
-      throw new Error('Alcore login did not start');
-    };
-    desktopInvoke = () => new Promise((resolve) => { resolveLogin = resolve; });
+    desktopEmailLoginHold = true;
 
     const lockedTree = await renderGate();
-    const input = findElement(lockedTree, 'input');
-    expect(input).not.toBeNull();
-    (input?.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: 'token-a' } });
+    const emailInput = findElement(lockedTree, 'input');
+    expect(emailInput).not.toBeNull();
+    (emailInput?.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: 'a@example.test' } });
 
-    const tokenTree = await renderGate();
-    const form = findElement(tokenTree, 'form');
-    expect(form).not.toBeNull();
-    const pending = (form?.props.onSubmit as (event: { preventDefault: () => void }) => Promise<void>)({ preventDefault: () => undefined });
+    const emailTree = await renderGate();
+    const emailForm = findElement(emailTree, 'form');
+    expect(emailForm).not.toBeNull();
+    (emailForm?.props.onSubmit as (event: { preventDefault: () => void }) => void)({ preventDefault: () => undefined });
+
+    const passwordTree = await renderGate();
+    const passwordInput = findElement(passwordTree, 'input');
+    expect(passwordInput).not.toBeNull();
+    (passwordInput?.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: 's3cret' } });
+
+    const passwordView = await renderGate();
+    const passwordForm = findElement(passwordView, 'form');
+    expect(passwordForm).not.toBeNull();
+    (passwordForm?.props.onSubmit as (event: { preventDefault: () => void }) => void)({ preventDefault: () => undefined });
     await Promise.resolve();
 
     runtimeApiBaseUrl = 'https://host-b.example';
     runtimeKey = 'host:b';
     runtimeEndpointChangedListener?.();
-    resolveLogin({ token: 'token-a' });
-    await pending;
+    finishEmailLogin();
+    await flushEffects();
+    await flushEffects();
 
     expect(desktopHostsGetCalls).toBe(0);
     expect(desktopHostsSetCalls).toBe(0);

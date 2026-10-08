@@ -1,6 +1,7 @@
 import { buildExternalManualRestartResponse } from './config-mutation-response.js';
 import { ThemeImportStorageError } from './theme-runtime.js';
 import { registerThemeCatalogRoutes } from './theme-catalog.js';
+import { createDesktopAuthRuntime } from '../desktop-auth/desktop-auth.js';
 
 const parseLoopbackUrl = (rawUrl) => {
   if (typeof rawUrl !== 'string') {
@@ -399,6 +400,9 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     // Display name a paired device shows for THIS server (issuing machine's
     // hostname), distinct from the per-device pairing label typed by the operator.
     getServerLabel = () => 'OpenChamber',
+    alcoreSecret,
+    alcorePreviousSecret,
+    alcoreIssuer,
   } = dependencies;
   const PAIRING_REDEEM_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
   const PAIRING_REDEEM_RATE_LIMIT_MAX_ATTEMPTS = 10;
@@ -670,10 +674,20 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
   app.post('/auth/session', (req, res) => {
     const requestScope = tunnelAuthController.classifyRequestScope(req);
     if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
-      return res.status(403).json({ error: 'Password login is disabled for tunnel scope', tunnelLocked: true });
+      return res.status(403).json({ error: 'Alcore login is disabled for tunnel scope', tunnelLocked: true });
     }
     return uiAuthController.handleSessionCreate(req, res);
   });
+
+  createDesktopAuthRuntime({
+    uiAuthController,
+    alcoreSecret,
+    alcorePreviousSecret,
+    alcoreIssuer,
+  }).registerRoutes({
+    get: (path, ...handlers) => app.get(path, ...handlers),
+    post: (path, ...handlers) => app.post(path, ...handlers),
+  }, { express, tunnelAuthController });
 
   app.post('/auth/url-token', async (req, res, next) => {
     try {

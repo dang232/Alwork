@@ -1621,90 +1621,6 @@ const navigateWindow = async (browserWindow, url, { allowAbort = false } = {}) =
   }
 };
 
-const extractCookieHeader = (response) => {
-  const getSetCookie = typeof response.headers?.getSetCookie === 'function'
-    ? response.headers.getSetCookie.bind(response.headers)
-    : null;
-  const cookies = getSetCookie ? getSetCookie() : [];
-  const rawCookies = cookies.length > 0
-    ? cookies
-    : String(response.headers?.get?.('set-cookie') || '').split(/,(?=\s*[^;,=]+=[^;,]+)/);
-  return rawCookies
-    .map((cookie) => String(cookie || '').split(';')[0].trim())
-    .filter(Boolean)
-    .join('; ');
-};
-
-const loginRemoteAndIssueClientToken = async ({ url, alcoreToken, trustDevice, requestHeaders }) => {
-  const baseUrl = normalizeHostUrl(String(url || ''));
-  const candidateToken = typeof alcoreToken === 'string' ? alcoreToken.trim() : '';
-  const safeRequestHeaders = sanitizeRuntimeRequestHeaders(requestHeaders || {});
-  if (!baseUrl) throw new Error('Invalid URL');
-  if (!candidateToken) throw new Error('Alcore token is required');
-
-  // Stable client identity so re-login reuses the same device record. Local
-  // uses the fixed desktop-local identity; remote uses this install's id with a
-  // regular 'desktop' kind.
-  const clientIdentity = isLocalRuntimeUrl(baseUrl)
-    ? { clientKind: LOCAL_DESKTOP_CLIENT_KIND, dedupeKey: LOCAL_DESKTOP_CLIENT_DEDUPE_KEY, ...desktopDeviceMetadata() }
-    : { clientKind: REMOTE_DESKTOP_CLIENT_KIND, dedupeKey: `desktop:${await getOrCreateDesktopInstallId()}`, ...desktopDeviceMetadata() };
-
-  // Keep a sub-path prefix (https://host/openchamber); new URL('/auth/session', base) would drop it.
-  const loginUrl = new URL(baseUrl);
-  loginUrl.pathname = `${loginUrl.pathname.replace(/\/+$/, '')}/auth/session`;
-  loginUrl.search = '';
-  const loginResponse = await fetch(loginUrl.toString(), {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-    headers: {
-      ...safeRequestHeaders,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      alcoreToken: candidateToken,
-      trustDevice: trustDevice === true,
-      issueClientToken: true,
-      clientLabel: 'OpenChamber Desktop',
-      ...clientIdentity,
-    }),
-  });
-  if (!loginResponse.ok) {
-    return { ok: false, status: loginResponse.status };
-  }
-
-  const loginPayload = await loginResponse.json().catch(() => null);
-  if (typeof loginPayload?.clientToken === 'string' && loginPayload.clientToken.trim()) {
-    return { ok: true, token: loginPayload.clientToken.trim() };
-  }
-
-  const cookie = extractCookieHeader(loginResponse);
-  if (!cookie) {
-    return { ok: false, status: 401 };
-  }
-
-  const tokenResponse = await fetch(new URL('/api/client-auth/clients', `${baseUrl}/`).toString(), {
-    method: 'POST',
-    signal: AbortSignal.timeout(10_000),
-    headers: {
-      ...safeRequestHeaders,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      Cookie: cookie,
-    },
-    body: JSON.stringify({
-      label: 'OpenChamber Desktop',
-      ...clientIdentity,
-    }),
-  });
-  if (!tokenResponse.ok) {
-    return { ok: false, status: tokenResponse.status };
-  }
-  const tokenPayload = await tokenResponse.json().catch(() => null);
-  const token = typeof tokenPayload?.token === 'string' ? tokenPayload.token.trim() : '';
-  return token ? { ok: true, token } : { ok: false, status: 500 };
-};
-
 const emitToWindow = (browserWindow, event, detail) => {
   if (!browserWindow || browserWindow.isDestroyed()) return;
   browserWindow.webContents.send('openchamber:emit', { event, detail });
@@ -4584,13 +4500,27 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
         String(args.expectedServerId || ''),
       ));
 
-    case 'desktop_remote_alcore_login':
-      return loginRemoteAndIssueClientToken({
-        url: args.url,
-        alcoreToken: args.alcoreToken,
-        trustDevice: args.trustDevice === true,
-        requestHeaders: args.requestHeaders || {},
+    case 'desktop_start_google_login': {
+      // Narrow by construction: the only URL this channel ever opens is the
+      // login page our own local server just minted — never renderer input.
+      // The system browser (not an app window) opens it so the user's Google
+      // session and its consent UI behave exactly like the web flow.
+      const localBase = typeof state.sidecarUrl === 'string' ? state.sidecarUrl.trim().replace(/\/$/, '') : '';
+      if (!localBase) throw new Error('Local server is not running');
+      const startResponse = await fetch(`${localBase}/api/auth/desktop/google/start`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(10_000),
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: '{}',
       });
+      if (!startResponse.ok) throw new Error(`Google login could not start (status ${startResponse.status})`);
+      const payload = await startResponse.json().catch(() => null);
+      const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
+      const pageUrl = typeof payload?.pageUrl === 'string' ? payload.pageUrl : '';
+      if (!requestId || !pageUrl) throw new Error('Google login could not start');
+      await shell.openExternal(`${localBase}${pageUrl}`);
+      return { requestId };
+    }
 
     case 'desktop_set_window_theme': {
       const mode = typeof args.themeMode === 'string' ? args.themeMode : '';

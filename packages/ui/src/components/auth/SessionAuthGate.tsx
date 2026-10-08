@@ -119,24 +119,31 @@ const readStoredTrustDevice = (): boolean => {
   return window.localStorage.getItem(TRUST_DEVICE_STORAGE_KEY) === 'true';
 };
 
-const submitAlcoreToken = async (alcoreToken: string, trustDevice: boolean): Promise<Response> => {
-  const issueClientToken = shouldIssueDesktopClientToken();
-  const response = await runtimeFetch(STATUS_CHECK_ENDPOINT, {
+const DESKTOP_AUTH_TIMEOUT_MS = 15_000;
+const GOOGLE_POLL_INTERVAL_MS = 2_000;
+const GOOGLE_POLL_MAX_ATTEMPTS = 150;
+
+type SignInView = 'signin' | 'password' | 'register' | 'code';
+
+type DesktopLoginResult = {
+  authenticated?: unknown;
+  clientToken?: unknown;
+  retryAfter?: unknown;
+  error?: unknown;
+};
+
+const postDesktopAuth = async (path: string, body: Record<string, unknown>): Promise<{ status: number; payload: DesktopLoginResult | null }> => {
+  const response = await runtimeFetch(path, {
     method: 'POST',
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify({
-      alcoreToken,
-      trustDevice,
-      issueClientToken,
-      clientLabel: 'OpenChamber Desktop',
-      ...desktopClientAuthMetadata(),
-    }),
+    body: JSON.stringify(body),
   });
-  return response;
+  const payload = await response.json().catch(() => null) as DesktopLoginResult | null;
+  return { status: response.status, payload };
 };
 
 const issueDesktopClientToken = async (): Promise<string> => {
@@ -161,8 +168,16 @@ const issueDesktopClientToken = async (): Promise<string> => {
   return typeof payload?.token === 'string' ? payload.token.trim() : '';
 };
 
-const shouldUseDesktopShellAlcoreLogin = (): boolean => {
-  return isDesktopShell() && !isLocalDesktopRuntime();
+const startGoogleLoginViaShell = async (): Promise<string> => {
+  if (!isDesktopShell() || typeof window === 'undefined') {
+    return '';
+  }
+  const started = await invokeDesktop('desktop_start_google_login', {}).catch(() => null);
+  if (!started || typeof started !== 'object') {
+    return '';
+  }
+  const requestId = (started as { requestId?: unknown }).requestId;
+  return typeof requestId === 'string' ? requestId.trim() : '';
 };
 
 const captureRuntimeIdentity = (): RuntimeIdentity => ({
@@ -172,37 +187,6 @@ const captureRuntimeIdentity = (): RuntimeIdentity => ({
 
 const isRuntimeIdentityActive = (identity: RuntimeIdentity): boolean => {
   return runtimeIdentityMatches(identity, captureRuntimeIdentity());
-};
-
-type DesktopAlcoreLoginResult = {
-  token: string;
-  status?: number;
-};
-
-const issueDesktopClientTokenViaShell = async (
-  alcoreToken: string,
-  trustDevice: boolean,
-  runtime: RuntimeIdentity,
-  requestHeaders: Record<string, string>,
-): Promise<DesktopAlcoreLoginResult | null> => {
-  if (!isDesktopShell() || typeof window === 'undefined') {
-    return null;
-  }
-  const response = await invokeDesktop('desktop_remote_alcore_login', {
-    url: runtime.apiBaseUrl,
-    alcoreToken,
-    trustDevice,
-    requestHeaders,
-  }).catch(() => null);
-  if (!response || typeof response !== 'object') {
-    return null;
-  }
-  const token = (response as { token?: unknown }).token;
-  const status = (response as { status?: unknown }).status;
-  return {
-    token: typeof token === 'string' ? token.trim() : '',
-    ...(typeof status === 'number' ? { status } : {}),
-  };
 };
 
 const persistDesktopClientToken = async (runtime: RuntimeIdentity, clientToken: string): Promise<boolean> => {
@@ -344,7 +328,12 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
   const skipAuth = vscodeRuntime;
   const showHostSwitcher = React.useMemo(() => isDesktopShell() && !vscodeRuntime, [vscodeRuntime]);
   const [state, setState] = React.useState<GateState>(() => (skipAuth ? 'authenticated' : 'pending'));
-  const [alcoreToken, setAlcoreToken] = React.useState('');
+  const [signInView, setSignInView] = React.useState<SignInView>('signin');
+  const [email, setEmail] = React.useState('');
+  const [password, setPassword] = React.useState('');
+  const [otpCode, setOtpCode] = React.useState('');
+  const [googleConfigured, setGoogleConfigured] = React.useState(false);
+  const [isGoogleBusy, setIsGoogleBusy] = React.useState(false);
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState('');
   const [retryAfter, setRetryAfter] = React.useState<number | undefined>(undefined);
@@ -354,7 +343,8 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
   const [isPasskeyBusy, setIsPasskeyBusy] = React.useState(false);
   const [trustDevice, setTrustDevice] = React.useState<boolean>(() => readStoredTrustDevice());
   const [activePasskeyAction, setActivePasskeyAction] = React.useState<'auth' | 'register' | null>(null);
-  const tokenInputRef = React.useRef<HTMLInputElement | null>(null);
+  const emailInputRef = React.useRef<HTMLInputElement | null>(null);
+  const googlePollTimerRef = React.useRef<number | null>(null);
   const hasResyncedRef = React.useRef(skipAuth);
   const hasBootstrapResyncedRef = React.useRef(skipAuth);
   // Whether the home directory was resolved after authentication. Until then
@@ -551,7 +541,11 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
 
     return subscribeRuntimeEndpointChanged(() => {
       cancelPasskeyCeremony();
-      setAlcoreToken('');
+      stopGooglePoll();
+      setEmail('');
+      setPassword('');
+      setOtpCode('');
+      setSignInView('signin');
       setErrorMessage('');
       setRetryAfter(undefined);
       setIsTunnelLocked(false);
@@ -609,11 +603,10 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
   }, [skipAuth, state]);
 
   React.useEffect(() => {
-    if (state === 'locked' && tokenInputRef.current) {
-      tokenInputRef.current.focus();
-      tokenInputRef.current.select();
+    if (state === 'locked' && signInView === 'signin' && emailInputRef.current) {
+      emailInputRef.current.focus();
     }
-  }, [state]);
+  }, [state, signInView]);
 
   React.useEffect(() => {
     if (skipAuth) {
@@ -637,11 +630,6 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     }
   }, [skipAuth, state]);
 
-  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    await handleAlcoreLogin(false);
-  };
-
   const registerPasskeyForCurrentSession = React.useCallback(async () => {
     const runtime = captureRuntimeIdentity();
     setActivePasskeyAction('register');
@@ -664,11 +652,85 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     setIsPasskeyBusy(false);
   }, []);
 
-  const handleAlcoreLogin = React.useCallback(async (enrollPasskey: boolean) => {
-    if (isTunnelLocked) {
+  const clearSignInSecrets = React.useCallback(() => {
+    setPassword('');
+    setOtpCode('');
+  }, []);
+
+  const enrollPasskeyAfterLoginRef = React.useRef(false);
+
+  const stopGooglePoll = React.useCallback(() => {
+    if (googlePollTimerRef.current !== null) {
+      window.clearTimeout(googlePollTimerRef.current);
+      googlePollTimerRef.current = null;
+    }
+    setIsGoogleBusy(false);
+  }, []);
+
+  React.useEffect(() => () => {
+    if (googlePollTimerRef.current !== null) {
+      window.clearTimeout(googlePollTimerRef.current);
+      googlePollTimerRef.current = null;
+    }
+  }, []);
+
+  const applyDesktopLoginResult = React.useCallback(async (
+    payload: DesktopLoginResult | null,
+    runtime: RuntimeIdentity,
+    requestHeaders: Record<string, string>,
+  ): Promise<boolean> => {
+    if (!isRuntimeIdentityActive(runtime)) return false;
+    let clientToken = shouldIssueDesktopClientToken()
+      && typeof payload?.clientToken === 'string' && payload.clientToken.trim()
+      ? payload.clientToken.trim()
+      : '';
+    if (shouldIssueDesktopClientToken() && !clientToken) {
+      clientToken = await issueDesktopClientToken();
+      if (!isRuntimeIdentityActive(runtime)) return false;
+    }
+    if (clientToken) {
+      if (!await applyDesktopClientToken(clientToken, runtime, requestHeaders)) return false;
+    }
+    if (!isRuntimeIdentityActive(runtime)) return false;
+    setIsTunnelLocked(false);
+    clearSignInSecrets();
+    enrollPasskeyAfterLoginRef.current = false;
+    setState('authenticated');
+    return true;
+  }, [clearSignInSecrets]);
+
+  const maybeEnrollPasskeyAfterLogin = React.useCallback(async (
+    runtime: RuntimeIdentity,
+  ): Promise<void> => {
+    if (!enrollPasskeyAfterLoginRef.current || !supportsPasskeys) return;
+    if (!isRuntimeIdentityActive(runtime)) return;
+    try {
+      await registerPasskeyForCurrentSession();
+      if (!isRuntimeIdentityActive(runtime)) return;
+      toast.success(t('sessionAuth.toast.passkeyAdded'));
+    } catch (error) {
+      if (isPasskeyCeremonyAbort(error)) {
+        toast.message(t('sessionAuth.toast.passkeySetupCanceled'));
+      } else {
+        const message = error instanceof Error ? error.message : t('sessionAuth.error.passkeySetupFailed');
+        toast.error(message);
+      }
+    }
+  }, [registerPasskeyForCurrentSession, supportsPasskeys, t]);
+
+  const sessionRequestFields = () => ({
+    trustDevice,
+    issueClientToken: shouldIssueDesktopClientToken(),
+    clientLabel: 'OpenChamber Desktop',
+    ...desktopClientAuthMetadata(),
+  });
+
+  const handleEmailLogin = React.useCallback(async () => {
+    if (isTunnelLocked || isSubmitting) {
       return;
     }
-    if (!alcoreToken || isSubmitting) {
+    const cleanEmail = email.trim();
+    if (!cleanEmail || !password) {
       return;
     }
 
@@ -682,128 +744,287 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     setErrorMessage('');
 
     try {
-      if (shouldUseDesktopShellAlcoreLogin()) {
-        const shellLogin = await issueDesktopClientTokenViaShell(alcoreToken, trustDevice, runtime, requestHeaders);
-        if (!isRuntimeIdentityActive(runtime)) return;
-        if (shellLogin?.token) {
-          setAlcoreToken('');
-          setIsTunnelLocked(false);
-          if (!await applyDesktopClientToken(shellLogin.token, runtime, requestHeaders)) return;
-          setState('authenticated');
-          return;
-        }
-        if (shellLogin?.status === 401) {
-          setErrorMessage(t('sessionAuth.error.invalidAlcoreToken'));
-          setIsTunnelLocked(false);
-          setState('locked');
-          return;
-        }
-        if (shellLogin?.status === 429) {
-          setRetryAfter(undefined);
-          setIsTunnelLocked(false);
-          setState('rate-limited');
-          return;
-        }
-      }
-
-      const response = await submitAlcoreToken(alcoreToken, trustDevice);
+      const { status, payload } = await postDesktopAuth('/api/auth/desktop/email/login', {
+        email: cleanEmail,
+        password,
+        ...sessionRequestFields(),
+      });
       if (!isRuntimeIdentityActive(runtime)) return;
-      if (response.ok) {
-        const payload = await response.json().catch(() => null) as { clientToken?: unknown } | null;
-        if (!isRuntimeIdentityActive(runtime)) return;
-        const shouldUseClientToken = shouldIssueDesktopClientToken();
-        let clientToken = '';
-        if (shouldUseClientToken) {
-          clientToken = typeof payload?.clientToken === 'string' && payload.clientToken.trim()
-            ? payload.clientToken.trim()
-            : '';
-          if (!clientToken) {
-            const shellLogin = await issueDesktopClientTokenViaShell(alcoreToken, trustDevice, runtime, requestHeaders);
-            if (!isRuntimeIdentityActive(runtime)) return;
-            clientToken = shellLogin?.token || await issueDesktopClientToken();
-            if (!isRuntimeIdentityActive(runtime)) return;
-          }
-        }
-        setAlcoreToken('');
-        setIsTunnelLocked(false);
-        if (clientToken) {
-          if (!await applyDesktopClientToken(clientToken, runtime, requestHeaders)) return;
-        }
-        if (enrollPasskey && supportsPasskeys) {
-          try {
-            await registerPasskeyForCurrentSession();
-            if (!isRuntimeIdentityActive(runtime)) return;
-            toast.success(t('sessionAuth.toast.passkeyAdded'));
-            setState('authenticated');
-            return;
-          } catch (error) {
-            if (isPasskeyCeremonyAbort(error)) {
-              toast.message(t('sessionAuth.toast.passkeySetupCanceled'));
-            } else {
-              const message = error instanceof Error ? error.message : t('sessionAuth.error.passkeySetupFailed');
-              toast.error(message);
-            }
-            setState('authenticated');
-            return;
-          }
-        }
-        setState('authenticated');
+      if (status === 200 && payload?.authenticated !== false) {
+        if (!await applyDesktopLoginResult(payload, runtime, requestHeaders)) return;
+        await maybeEnrollPasskeyAfterLogin(runtime);
         return;
       }
-
-      if (response.status === 401) {
-        setErrorMessage(t('sessionAuth.error.invalidAlcoreToken'));
-        setIsTunnelLocked(false);
+      if (status === 401) {
+        setErrorMessage(t('sessionAuth.signin.error.invalidCredentials'));
         setState('locked');
         return;
       }
-
-      if (response.status === 429) {
-        const data = await response.json().catch(() => ({}));
-        setRetryAfter(data.retryAfter);
-        setIsTunnelLocked(false);
+      if (status === 403) {
+        setSignInView('code');
+        setErrorMessage(t('sessionAuth.signin.error.emailNotVerified'));
+        setState('locked');
+        return;
+      }
+      if (status === 429) {
+        const retryAfter = typeof payload?.retryAfter === 'number' ? payload.retryAfter : undefined;
+        setRetryAfter(retryAfter);
         setState('rate-limited');
         return;
       }
-
+      if (status === 503) {
+        setErrorMessage(t('sessionAuth.signin.error.unavailable'));
+        setState('locked');
+        return;
+      }
       setErrorMessage(t('sessionAuth.error.unexpectedResponse'));
-      setIsTunnelLocked(false);
-      setState('error');
+      setState('locked');
     } catch (error) {
       if (!isRuntimeIdentityActive(runtime)) return;
-      console.warn('Failed to submit Alcore token:', error);
-      const shellLogin = shouldUseDesktopShellAlcoreLogin()
-        ? await issueDesktopClientTokenViaShell(alcoreToken, trustDevice, runtime, requestHeaders)
-        : null;
-      if (!isRuntimeIdentityActive(runtime)) return;
-      if (shellLogin?.token) {
-        setAlcoreToken('');
-        setIsTunnelLocked(false);
-        if (!await applyDesktopClientToken(shellLogin.token, runtime, requestHeaders)) return;
-        setState('authenticated');
-        return;
-      }
-      if (shellLogin?.status === 401) {
-        setErrorMessage(t('sessionAuth.error.invalidAlcoreToken'));
-        setIsTunnelLocked(false);
-        setState('locked');
-        return;
-      }
-      if (shellLogin?.status === 429) {
-        setRetryAfter(undefined);
-        setIsTunnelLocked(false);
-        setState('rate-limited');
-        return;
-      }
+      console.warn('Failed to sign in with email:', error);
       setErrorMessage(t('sessionAuth.error.networkRetry'));
-      setIsTunnelLocked(false);
       setState('error');
     } finally {
       if (isRuntimeIdentityActive(runtime)) {
         setIsSubmitting(false);
       }
     }
-  }, [cancelActivePasskey, isPasskeyBusy, isSubmitting, isTunnelLocked, alcoreToken, registerPasskeyForCurrentSession, supportsPasskeys, t, trustDevice]);
+  }, [applyDesktopLoginResult, cancelActivePasskey, email, isPasskeyBusy, isSubmitting, isTunnelLocked, maybeEnrollPasskeyAfterLogin, password, t, trustDevice]);
+
+  const handleEmailRegister = React.useCallback(async () => {
+    if (isTunnelLocked || isSubmitting) {
+      return;
+    }
+    const cleanEmail = email.trim();
+    if (!cleanEmail || !password) {
+      return;
+    }
+
+    const runtime = captureRuntimeIdentity();
+    setIsSubmitting(true);
+    setErrorMessage('');
+
+    try {
+      const { status } = await postDesktopAuth('/api/auth/desktop/email/register', {
+        email: cleanEmail,
+        password,
+      });
+      if (!isRuntimeIdentityActive(runtime)) return;
+      if (status === 202) {
+        setSignInView('code');
+        setErrorMessage('');
+        setState('locked');
+        return;
+      }
+      if (status === 409) {
+        setErrorMessage(t('sessionAuth.signin.error.accountExists'));
+        setState('locked');
+        return;
+      }
+      if (status === 429) {
+        setRetryAfter(undefined);
+        setState('rate-limited');
+        return;
+      }
+      setErrorMessage(t('sessionAuth.error.unexpectedResponse'));
+      setState('locked');
+    } catch (error) {
+      if (!isRuntimeIdentityActive(runtime)) return;
+      console.warn('Failed to create account:', error);
+      setErrorMessage(t('sessionAuth.error.networkRetry'));
+      setState('error');
+    } finally {
+      if (isRuntimeIdentityActive(runtime)) {
+        setIsSubmitting(false);
+      }
+    }
+  }, [email, isSubmitting, isTunnelLocked, password, t]);
+
+  const handleVerifyOtp = React.useCallback(async () => {
+    if (isTunnelLocked || isSubmitting) {
+      return;
+    }
+    const cleanEmail = email.trim();
+    const cleanCode = otpCode.trim();
+    if (!cleanEmail || !cleanCode) {
+      return;
+    }
+
+    const runtime = captureRuntimeIdentity();
+    const requestHeaders = getRuntimeExtraHeadersSync();
+    setIsSubmitting(true);
+    setErrorMessage('');
+
+    try {
+      const { status, payload } = await postDesktopAuth('/api/auth/desktop/email/verify-otp', {
+        email: cleanEmail,
+        code: cleanCode,
+        ...sessionRequestFields(),
+      });
+      if (!isRuntimeIdentityActive(runtime)) return;
+      if (status === 200 && payload?.authenticated !== false) {
+        if (!await applyDesktopLoginResult(payload, runtime, requestHeaders)) return;
+        await maybeEnrollPasskeyAfterLogin(runtime);
+        return;
+      }
+      if (status === 400) {
+        setErrorMessage(t('sessionAuth.signin.error.invalidCode'));
+        setState('locked');
+        return;
+      }
+      if (status === 429) {
+        const retryAfter = typeof payload?.retryAfter === 'number' ? payload.retryAfter : undefined;
+        setRetryAfter(retryAfter);
+        setState('rate-limited');
+        return;
+      }
+      if (status === 503) {
+        setErrorMessage(t('sessionAuth.signin.error.unavailable'));
+        setState('locked');
+        return;
+      }
+      setErrorMessage(t('sessionAuth.error.unexpectedResponse'));
+      setState('locked');
+    } catch (error) {
+      if (!isRuntimeIdentityActive(runtime)) return;
+      console.warn('Failed to verify code:', error);
+      setErrorMessage(t('sessionAuth.error.networkRetry'));
+      setState('error');
+    } finally {
+      if (isRuntimeIdentityActive(runtime)) {
+        setIsSubmitting(false);
+      }
+    }
+  }, [applyDesktopLoginResult, email, isSubmitting, isTunnelLocked, maybeEnrollPasskeyAfterLogin, otpCode, t, trustDevice]);
+
+  const handleResendOtp = React.useCallback(async () => {
+    if (isTunnelLocked || isSubmitting) {
+      return;
+    }
+    const cleanEmail = email.trim();
+    if (!cleanEmail) {
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      await postDesktopAuth('/api/auth/desktop/email/otp-resend', { email: cleanEmail });
+      toast.message(t('sessionAuth.signin.info.codeSent'));
+    } catch (error) {
+      console.warn('Failed to resend code:', error);
+      setErrorMessage(t('sessionAuth.error.networkRetry'));
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [email, isSubmitting, isTunnelLocked, t]);
+
+  const handleGoogleLogin = React.useCallback(async () => {
+    if (isTunnelLocked || isSubmitting || isGoogleBusy) {
+      return;
+    }
+    if (!isDesktopShell()) {
+      setErrorMessage(t('sessionAuth.signin.error.googleUnavailable'));
+      return;
+    }
+
+    if (isPasskeyBusy) {
+      cancelActivePasskey();
+    }
+
+    const runtime = captureRuntimeIdentity();
+    const requestHeaders = getRuntimeExtraHeadersSync();
+    setIsGoogleBusy(true);
+    setErrorMessage('');
+
+    const requestId = await startGoogleLoginViaShell();
+    if (!isRuntimeIdentityActive(runtime)) return;
+    if (!requestId) {
+      setIsGoogleBusy(false);
+      setErrorMessage(t('sessionAuth.signin.error.googleFailed'));
+      return;
+    }
+
+    let attempts = 0;
+    const poll = async (): Promise<void> => {
+      if (!isRuntimeIdentityActive(runtime)) return;
+      attempts += 1;
+      try {
+        const { status, payload } = await postDesktopAuth('/api/auth/desktop/google-complete', {
+          requestId,
+          ...sessionRequestFields(),
+        });
+        if (!isRuntimeIdentityActive(runtime)) return;
+        if (status === 200 && payload?.authenticated !== false) {
+          stopGooglePoll();
+          if (!await applyDesktopLoginResult(payload, runtime, requestHeaders)) return;
+          await maybeEnrollPasskeyAfterLogin(runtime);
+          return;
+        }
+        if (status === 404) {
+          if (attempts < GOOGLE_POLL_MAX_ATTEMPTS && isRuntimeIdentityActive(runtime)) {
+            googlePollTimerRef.current = window.setTimeout(() => { void poll(); }, GOOGLE_POLL_INTERVAL_MS);
+            return;
+          }
+          stopGooglePoll();
+          if (!isRuntimeIdentityActive(runtime)) return;
+          setErrorMessage(t('sessionAuth.signin.error.googleExpired'));
+          return;
+        }
+        stopGooglePoll();
+        if (!isRuntimeIdentityActive(runtime)) return;
+        if (status === 401 || status === 409) {
+          setErrorMessage(t('sessionAuth.signin.error.googleFailed'));
+        } else if (status === 429) {
+          const retryAfter = typeof payload?.retryAfter === 'number' ? payload.retryAfter : undefined;
+          setRetryAfter(retryAfter);
+          setState('rate-limited');
+        } else {
+          setErrorMessage(t('sessionAuth.signin.error.unavailable'));
+        }
+      } catch (error) {
+        if (!isRuntimeIdentityActive(runtime)) return;
+        if (attempts < GOOGLE_POLL_MAX_ATTEMPTS && isRuntimeIdentityActive(runtime)) {
+          googlePollTimerRef.current = window.setTimeout(() => { void poll(); }, GOOGLE_POLL_INTERVAL_MS);
+          return;
+        }
+        console.warn('Google login did not complete:', error);
+        stopGooglePoll();
+        if (!isRuntimeIdentityActive(runtime)) return;
+        setErrorMessage(t('sessionAuth.error.networkRetry'));
+      }
+    };
+    googlePollTimerRef.current = window.setTimeout(() => { void poll(); }, GOOGLE_POLL_INTERVAL_MS);
+  }, [applyDesktopLoginResult, cancelActivePasskey, isGoogleBusy, isPasskeyBusy, isSubmitting, isTunnelLocked, maybeEnrollPasskeyAfterLogin, stopGooglePoll, t, trustDevice]);
+
+  const handleGoogleCancel = React.useCallback(() => {
+    stopGooglePoll();
+  }, [stopGooglePoll]);
+
+  React.useEffect(() => {
+    if (skipAuth || state !== 'locked') {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await runtimeFetch('/api/auth/desktop/config', {
+          method: 'GET',
+          credentials: 'include',
+          headers: { Accept: 'application/json' },
+        });
+        const payload = await response.json().catch(() => null) as { googleConfigured?: unknown } | null;
+        if (!cancelled) {
+          setGoogleConfigured(payload?.googleConfigured === true);
+        }
+      } catch {
+        if (!cancelled) {
+          setGoogleConfigured(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [skipAuth, state]);
 
   const handlePasskeySignIn = React.useCallback(async () => {
     if (isSubmitting || !supportsPasskeys) {
@@ -835,7 +1056,6 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
         if (!await applyDesktopClientToken(clientToken, runtime, requestHeaders)) return;
       }
 
-      setAlcoreToken('');
       setState('authenticated');
     } catch (error) {
       if (!isRuntimeIdentityActive(runtime)) return;
@@ -864,11 +1084,9 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     }
 
     if (state !== 'authenticated') {
-      if (!alcoreToken) {
-        setErrorMessage(t('sessionAuth.error.enterTokenForPasskey'));
-        return;
-      }
-      await handleAlcoreLogin(true);
+      enrollPasskeyAfterLoginRef.current = true;
+      setSignInView('signin');
+      setErrorMessage(t('sessionAuth.signin.info.signInFirstForPasskey'));
       return;
     }
 
@@ -884,7 +1102,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
       const message = error instanceof Error ? error.message : t('sessionAuth.error.passkeySetupFailed');
       toast.error(message);
     }
-  }, [cancelActivePasskey, handleAlcoreLogin, isPasskeyBusy, isSubmitting, isTunnelLocked, alcoreToken, registerPasskeyForCurrentSession, state, supportsPasskeys, t]);
+  }, [cancelActivePasskey, isPasskeyBusy, isSubmitting, isTunnelLocked, registerPasskeyForCurrentSession, state, supportsPasskeys, t]);
 
   const canOfferPasskeySetup = supportsPasskeys && passkeyStatus.enabled;
   const canUsePasskey = canOfferPasskeySetup && passkeyStatus.hasPasskeys;
@@ -918,24 +1136,24 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
         <div className="flex flex-col items-center gap-6 w-full max-w-xs">
           <div className="flex flex-col items-center gap-1 text-center">
             <h1 className="text-xl font-semibold text-foreground">
-              {isTunnelLocked ? t('sessionAuth.locked.tunnelTitle') : t('sessionAuth.locked.alcoreTitle')}
+              {isTunnelLocked ? t('sessionAuth.locked.tunnelTitle') : t('sessionAuth.signin.title')}
             </h1>
             <p className="typography-meta text-muted-foreground">
               {isTunnelLocked
                 ? t('sessionAuth.locked.tunnelDescription')
-                : t('sessionAuth.locked.alcoreDescription')}
+                : t('sessionAuth.signin.description')}
             </p>
           </div>
 
-          {!isTunnelLocked && (
-            <form onSubmit={handleSubmit} className="w-full space-y-2">
+          {!isTunnelLocked && signInView === 'signin' && (
+            <div className="w-full space-y-2">
               {canUsePasskey && (
                 <Button
                   type="button"
                   variant="outline"
                   className="w-full"
                   onClick={() => void handlePasskeySignIn()}
-                  disabled={isSubmitting || (isPasskeyBusy && activePasskeyAction !== 'auth')}
+                  disabled={isSubmitting || isGoogleBusy || (isPasskeyBusy && activePasskeyAction !== 'auth')}
                 >
                   {isPasskeyBusy ? (
                     <Icon name="loader-4" className="h-4 w-4 animate-spin" />
@@ -947,80 +1165,308 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
                     : t('sessionAuth.actions.usePasskey')}</span>
                 </Button>
               )}
-              <div className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <Icon name="lock" className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/60" />
-                  <Input
-                    id="openchamber-alcore-token"
-                    ref={tokenInputRef}
-                    type="password"
-                    autoComplete="off"
-                    placeholder={t('sessionAuth.alcoreToken.placeholder')}
-                    value={alcoreToken}
-                    onChange={(event) => {
-                      setAlcoreToken(event.target.value);
-                      if (errorMessage) {
-                        setErrorMessage('');
-                      }
-                    }}
-                    className="pl-10"
-                    aria-invalid={Boolean(errorMessage) || undefined}
-                    aria-describedby={errorMessage ? 'oc-ui-auth-error' : undefined}
-                    disabled={isSubmitting}
-                  />
-                </div>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (email.trim()) {
+                    setSignInView('password');
+                    setErrorMessage('');
+                  }
+                }}
+                className="w-full space-y-2"
+              >
+                <Input
+                  id="openchamber-signin-email"
+                  ref={emailInputRef}
+                  type="email"
+                  autoComplete="email"
+                  placeholder={t('sessionAuth.signin.emailPlaceholder')}
+                  value={email}
+                  onChange={(event) => {
+                    setEmail(event.target.value);
+                    if (errorMessage) {
+                      setErrorMessage('');
+                    }
+                  }}
+                  disabled={isSubmitting || isGoogleBusy}
+                  aria-invalid={Boolean(errorMessage) || undefined}
+                  aria-describedby={errorMessage ? 'oc-ui-auth-error' : undefined}
+                />
                 <Button
                   type="submit"
-                  size="icon"
-                  disabled={!alcoreToken || isSubmitting}
-                  aria-label={isSubmitting ? t('sessionAuth.actions.signingInAria') : t('sessionAuth.actions.signInAria')}
+                  className="w-full"
+                  disabled={!email.trim() || isSubmitting || isGoogleBusy}
                 >
-                  {isSubmitting ? (
-                    <Icon name="loader-4" className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Icon name="lock-unlock" className="h-4 w-4" />
-                  )}
+                  {t('sessionAuth.signin.continue')}
                 </Button>
-              </div>
+              </form>
+              {googleConfigured && showHostSwitcher && (
+                <>
+                  <div className="flex items-center gap-3 py-1" aria-hidden>
+                    <span className="h-px flex-1 bg-border" />
+                    <span className="typography-micro text-muted-foreground">{t('sessionAuth.signin.or')}</span>
+                    <span className="h-px flex-1 bg-border" />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => void handleGoogleLogin()}
+                    disabled={isSubmitting || isGoogleBusy}
+                  >
+                    {isGoogleBusy ? (
+                      <Icon name="loader-4" className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Icon name="google-fill" className="h-4 w-4" />
+                    )}
+                    <span>{isGoogleBusy
+                      ? t('sessionAuth.signin.googleWaiting')
+                      : t('sessionAuth.signin.googleButton')}</span>
+                  </Button>
+                  {isGoogleBusy && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="w-full text-muted-foreground hover:text-foreground"
+                      onClick={handleGoogleCancel}
+                    >
+                      {t('sessionAuth.signin.cancel')}
+                    </Button>
+                  )}
+                </>
+              )}
+              <label className="flex items-center justify-center gap-2 pt-1 text-center typography-micro text-muted-foreground">
+                <Checkbox
+                  checked={trustDevice}
+                  onChange={setTrustDevice}
+                  disabled={isSubmitting || isGoogleBusy}
+                  ariaLabel={t('sessionAuth.actions.trustDeviceAria')}
+                  className="size-4"
+                  iconClassName="size-4"
+                />
+                <span>{t('sessionAuth.actions.trustDevice')}</span>
+              </label>
               {canOfferPasskeySetup ? (
-                <div className="flex items-center justify-between pt-1">
-                  <label className="flex items-center gap-2 text-center typography-micro text-muted-foreground">
-                    <Checkbox
-                      checked={trustDevice}
-                      onChange={setTrustDevice}
-                      disabled={isSubmitting}
-                      ariaLabel={t('sessionAuth.actions.trustDeviceAria')}
-                      className="size-4"
-                      iconClassName="size-4"
-                    />
-                    <span>{t('sessionAuth.actions.trustDevice')}</span>
-                  </label>
+                <div className="flex items-center justify-center pt-1">
                   <Button
                     type="button"
                     variant="ghost"
                     size="sm"
                     className="text-muted-foreground hover:text-foreground"
                     onClick={() => void handlePasskeySetupOnly()}
-                    disabled={isSubmitting}
+                    disabled={isSubmitting || isGoogleBusy}
                   >
                     {isPasskeyBusy && activePasskeyAction === 'register'
                       ? t('sessionAuth.actions.cancelPasskeySetup')
                       : t('sessionAuth.actions.addPasskey')}
                   </Button>
                 </div>
-              ) : (
-                <label className="flex items-center justify-center gap-2 pt-1 text-center typography-micro text-muted-foreground">
-                  <Checkbox
-                    checked={trustDevice}
-                    onChange={setTrustDevice}
-                    disabled={isSubmitting}
-                    ariaLabel={t('sessionAuth.actions.trustDeviceAria')}
-                    className="size-4"
-                    iconClassName="size-4"
-                  />
-                  <span>{t('sessionAuth.actions.trustDevice')}</span>
-                </label>
+              ) : null}
+              {errorMessage && (
+                <p id="oc-ui-auth-error" className="typography-meta text-destructive">
+                  {errorMessage}
+                </p>
               )}
+            </div>
+          )}
+
+          {!isTunnelLocked && signInView === 'password' && (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleEmailLogin();
+              }}
+              className="w-full space-y-2"
+            >
+              <p className="typography-meta text-muted-foreground truncate text-center">{email.trim()}</p>
+              <Input
+                id="openchamber-signin-password"
+                type="password"
+                autoComplete="current-password"
+                placeholder={t('sessionAuth.signin.passwordPlaceholder')}
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  if (errorMessage) {
+                    setErrorMessage('');
+                  }
+                }}
+                disabled={isSubmitting}
+                aria-invalid={Boolean(errorMessage) || undefined}
+                aria-describedby={errorMessage ? 'oc-ui-auth-error' : undefined}
+              />
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={!password || isSubmitting}
+              >
+                {t('sessionAuth.signin.signIn')}
+              </Button>
+              <div className="flex items-center justify-between pt-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setSignInView('signin');
+                    setErrorMessage('');
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {t('sessionAuth.signin.back')}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setSignInView('register');
+                    setErrorMessage('');
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {t('sessionAuth.signin.createAccount')}
+                </Button>
+              </div>
+              {errorMessage && (
+                <p id="oc-ui-auth-error" className="typography-meta text-destructive">
+                  {errorMessage}
+                </p>
+              )}
+            </form>
+          )}
+
+          {!isTunnelLocked && signInView === 'register' && (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleEmailRegister();
+              }}
+              className="w-full space-y-2"
+            >
+              <p className="typography-meta text-muted-foreground truncate text-center">{email.trim()}</p>
+              <Input
+                id="openchamber-signin-new-password"
+                type="password"
+                autoComplete="new-password"
+                placeholder={t('sessionAuth.signin.passwordPlaceholder')}
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  if (errorMessage) {
+                    setErrorMessage('');
+                  }
+                }}
+                disabled={isSubmitting}
+                aria-invalid={Boolean(errorMessage) || undefined}
+                aria-describedby={errorMessage ? 'oc-ui-auth-error' : undefined}
+              />
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={!password || isSubmitting}
+              >
+                {t('sessionAuth.signin.createAccountButton')}
+              </Button>
+              <div className="flex items-center justify-between pt-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setSignInView('signin');
+                    setErrorMessage('');
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {t('sessionAuth.signin.back')}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setSignInView('password');
+                    setErrorMessage('');
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {t('sessionAuth.signin.haveAccount')}
+                </Button>
+              </div>
+              {errorMessage && (
+                <p id="oc-ui-auth-error" className="typography-meta text-destructive">
+                  {errorMessage}
+                </p>
+              )}
+            </form>
+          )}
+
+          {!isTunnelLocked && signInView === 'code' && (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleVerifyOtp();
+              }}
+              className="w-full space-y-2"
+            >
+              <p className="typography-meta text-muted-foreground text-center">
+                {t('sessionAuth.signin.codeDescription', { email: email.trim() })}
+              </p>
+              <Input
+                id="openchamber-signin-code"
+                type="text"
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                placeholder={t('sessionAuth.signin.codePlaceholder')}
+                value={otpCode}
+                onChange={(event) => {
+                  setOtpCode(event.target.value);
+                  if (errorMessage) {
+                    setErrorMessage('');
+                  }
+                }}
+                disabled={isSubmitting}
+                aria-invalid={Boolean(errorMessage) || undefined}
+                aria-describedby={errorMessage ? 'oc-ui-auth-error' : undefined}
+              />
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={!otpCode.trim() || isSubmitting}
+              >
+                {t('sessionAuth.signin.verify')}
+              </Button>
+              <div className="flex items-center justify-between pt-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setSignInView('signin');
+                    setErrorMessage('');
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {t('sessionAuth.signin.back')}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => void handleResendOtp()}
+                  disabled={isSubmitting}
+                >
+                  {t('sessionAuth.signin.resend')}
+                </Button>
+              </div>
               {errorMessage && (
                 <p id="oc-ui-auth-error" className="typography-meta text-destructive">
                   {errorMessage}
