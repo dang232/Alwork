@@ -62,13 +62,16 @@ const SESSION = ['session'];
 const SESSION_OR_SCHEDULE = ['session', 'schedule'];
 const TUNNEL = ['tunnel'];
 const LOGS = ['logs'];
+const DAG = ['dag'];
+// `dag status|stream` reuses the session/message vocabulary for run targets.
+const SESSION_OR_SCHEDULE_OR_DAG = ['session', 'schedule', 'dag'];
 const COMMAND_OWNED_FLAGS = new Map([
   ['daily', SCHEDULE], ['weekly', SCHEDULE], ['once', SCHEDULE], ['time', SCHEDULE], ['cron', SCHEDULE],
   ['timezone', SCHEDULE], ['disabled', SCHEDULE], ['task', SCHEDULE],
   ['role', SESSION], ['last', SESSION], ['last-assistant', SESSION], ['wait', SESSION], ['timeout', SESSION],
   ['with-status', SESSION], ['worktree', SESSION], ['branch', SESSION], ['start-ref', SESSION], ['base', SESSION],
   ['upstream', SESSION], ['no-upstream', SESSION], ['title', SESSION],
-  ['session', SESSION_OR_SCHEDULE], ['message', SESSION_OR_SCHEDULE], ['prompt', SESSION_OR_SCHEDULE],
+  ['session', SESSION_OR_SCHEDULE_OR_DAG], ['message', SESSION_OR_SCHEDULE_OR_DAG], ['prompt', SESSION_OR_SCHEDULE],
   ['model', SESSION_OR_SCHEDULE], ['agent', SESSION_OR_SCHEDULE], ['variant', SESSION_OR_SCHEDULE],
   ['goal', SESSION_OR_SCHEDULE], ['goal-token-budget', SESSION_OR_SCHEDULE], ['project', SESSION_OR_SCHEDULE],
   ['dir', SESSION_OR_SCHEDULE], ['directory', SESSION_OR_SCHEDULE],
@@ -76,6 +79,7 @@ const COMMAND_OWNED_FLAGS = new Map([
   ['token-file', TUNNEL], ['token-stdin', TUNNEL], ['connect-ttl', TUNNEL], ['session-ttl', TUNNEL],
   ['show-secrets', TUNNEL], ['dry-run', TUNNEL], ['force', TUNNEL],
   ['lines', LOGS], ['no-follow', LOGS],
+  ['snapshot-dir', DAG], ['attach', DAG],
 ]);
 
 function parseArgs(argv = process.argv.slice(2)) {
@@ -137,6 +141,8 @@ function parseArgs(argv = process.argv.slice(2)) {
     timeout: undefined,
     lastAssistant: false,
     withStatus: false,
+    snapshotDir: undefined,
+    attach: undefined,
   };
 
   const removedFlagErrors = [];
@@ -457,6 +463,18 @@ function parseArgs(argv = process.argv.slice(2)) {
       case 'no-follow':
         options.follow = false;
         break;
+      case 'snapshot-dir': {
+        const { value, nextIndex } = consumeValue(i, inlineValue);
+        i = nextIndex;
+        if (value !== undefined) options.snapshotDir = value;
+        break;
+      }
+      case 'attach': {
+        const { value, nextIndex } = consumeValue(i, inlineValue);
+        i = nextIndex;
+        if (value !== undefined) options.attach = value;
+        break;
+      }
       case 'no-env-snapshot':
         options.envSnapshot = false;
         break;
@@ -565,6 +583,7 @@ function parseArgs(argv = process.argv.slice(2)) {
   const startupAction = command === 'startup' ? (positional[1] || 'status') : null;
   const scheduleAction = command === 'schedule' ? (positional[1] || 'help') : null;
   const sessionAction = command === 'session' ? (positional[1] || 'help') : null;
+  const dagAction = command === 'dag' ? (positional[1] || 'help') : null;
   const controlAction = command === 'control' ? (positional[1] || 'help') : null;
 
   if (options.lan && typeof options.host !== 'string') {
@@ -582,6 +601,7 @@ function parseArgs(argv = process.argv.slice(2)) {
     startupAction,
     scheduleAction,
     sessionAction,
+    dagAction,
     controlAction,
     options,
     removedFlagErrors,
@@ -604,6 +624,7 @@ COMMANDS:
   status         Show server status
   schedule       Manage scheduled tasks
   session        Create, inspect, and read OpenChamber sessions
+  dag            Show DAG run snapshots and stream engine runs (text-only)
   models         Show default and favorite models
   projects       Show configured projects and IDs
   control        Show OpenChamber control-plane commands

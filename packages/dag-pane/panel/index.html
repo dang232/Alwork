@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAG runs</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--oc-bg, #fff);
+    color: var(--oc-fg, #111);
+    font-family: var(--oc-font, system-ui, sans-serif);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  #app { display: flex; flex-direction: column; gap: 12px; padding: 12px; min-height: 100vh; box-sizing: border-box; }
+  .dag-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .dag-title { font-size: 15px; font-weight: 650; margin: 0; }
+  .dag-controls { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
+  .dag-notice-slot:empty { display: none; }
+  .dag-content { display: flex; flex-direction: column; gap: 12px; }
+  .dag-run-head { display: flex; align-items: center; gap: 8px; }
+  .dag-run-name { font-size: 14px; font-weight: 600; margin: 0; }
+  .dag-run-counts { margin: 0; color: var(--oc-muted); font-size: 12px; }
+  .dag-graph { width: 100%; height: auto; background: var(--oc-elevated); border: 1px solid var(--oc-border); border-radius: var(--oc-radius); }
+  .dag-node { cursor: pointer; }
+  .dag-node:focus-visible { outline: none; }
+  .dag-node:focus-visible rect { stroke: var(--oc-focus); stroke-width: 2.5; }
+  .dag-details { background: var(--oc-elevated); border: 1px solid var(--oc-border); border-radius: var(--oc-radius); padding: 12px; }
+  .dag-details-title { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+  .dag-details-list { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+  .dag-details-term { color: var(--oc-muted); font-family: var(--oc-mono, monospace); font-size: 12px; }
+  .dag-details-value { margin: 0; overflow-wrap: anywhere; }
+  .dag-steer-bar { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; border-top: 1px solid var(--oc-border); padding-top: 12px; }
+  .dag-steer-field { flex: 1 1 200px; min-width: 160px; }
+  .dag-steer-buttons { display: flex; gap: 8px; }
+  .dag-wrapper-row { display: block; }
+  .dag-wrapper-field { max-width: 480px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="./main.js"></script>
+</body>
+</html>

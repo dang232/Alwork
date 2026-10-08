@@ -46,6 +46,16 @@ export type ContextSurfaceDescriptor = {
   defaultWidthFraction: number;
 };
 
+/**
+ * Third-party guest surfaces the Electron desktop shell hosts alone
+ * (project-ide todo 13: the DAG side pane). The pane's engine bridge is a
+ * desktop-local service, so offering the rail icon on web, VS Code, or
+ * mobile would promise a panel that cannot work there. Listed by surface
+ * id (`plugin:<guest-id>`); guests outside this list keep the existing
+ * desktop/web behavior.
+ */
+export const DESKTOP_ONLY_PLUGIN_SURFACE_IDS: readonly string[] = ['plugin:omo-dag-pane'];
+
 export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
   {
     id: 'context',
@@ -206,6 +216,10 @@ type VisibleRailSurfacesOptions = {
   hiddenSurfaces?: readonly string[];
   planModeEnabled: boolean;
   isVSCode: boolean;
+  /** True inside the Electron desktop shell (see `@/lib/desktop`).
+      Undefined keeps the previous behavior for callers that do not know
+      their shell: desktop-only guest surfaces stay hidden. */
+  isDesktopShell?: boolean;
   screenWidth: number;
   tabs: readonly { mode: ContextPanelMode }[];
   /** The pull-request rail icon stays off until a GitHub or GitLab account is
@@ -231,6 +245,9 @@ export const getVisibleContextRailSurfaces = (options: VisibleRailSurfacesOption
       return false;
     }
     if (isPluginContextPanelMode(surface.mode) && options.isVSCode) {
+      return false;
+    }
+    if (!options.isDesktopShell && DESKTOP_ONLY_PLUGIN_SURFACE_IDS.includes(surface.id)) {
       return false;
     }
     if (surface.id === 'plan' && !options.planModeEnabled) {

@@ -1,0 +1,26 @@
+{
+  "name": "omo-dag-pane",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Third-party SDK guest: DAG side pane for OmO runs (project-ide todo 13). Desktop-only surface; install the folder from Settings -> Extensions.",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=1.22.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "omo-dag-pane",
+        "name": "DAG runs",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      },
+      "attach": false
+    }
+  }
+}

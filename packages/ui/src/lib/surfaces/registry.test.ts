@@ -84,4 +84,20 @@ describe('getVisibleContextRailSurfaces', () => {
     expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [hello] }).some((s) => s.id === 'plugin:hello')).toBe(true);
     expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [hello], isVSCode: true }).some((s) => s.id === 'plugin:hello')).toBe(false);
   });
+
+  test('keeps the DAG side pane on the Electron desktop shell only', () => {
+    const dag = {
+      id: 'plugin:omo-dag-pane' as const,
+      mode: 'plugin:omo-dag-pane' as const,
+      icon: 'window' as const,
+      label: 'DAG runs',
+      labelKey: 'contextRail.surface.plugin' as const,
+      descriptionKey: 'contextRail.surface.plugin.description' as const,
+      availability: 'always' as const,
+      defaultWidthFraction: 0.45,
+    };
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [dag] }).some((s) => s.id === 'plugin:omo-dag-pane')).toBe(false);
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [dag], isVSCode: true }).some((s) => s.id === 'plugin:omo-dag-pane')).toBe(false);
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [dag], isDesktopShell: true }).some((s) => s.id === 'plugin:omo-dag-pane')).toBe(true);
+  });
 });

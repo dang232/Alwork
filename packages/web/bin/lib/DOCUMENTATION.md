@@ -31,6 +31,12 @@ Command modules implement user-facing commands and preserve output contracts acr
   - Message projection matches Export Markdown semantics: only ordered `text` parts are exposed; tool, reasoning, file, and other parts are omitted.
   - The server control service owns create/worktree/prompt orchestration, official OpenCode reads, Goal Mode, wait semantics, and partial failures.
 
+- `commands-dag.js`
+  - Implements `openchamber dag status` and `openchamber dag stream` (project-ide todo 13: text-only CLI parity for the DAG side pane).
+  - `status` reads the adapter-A snapshot file for one run session and prints runs/nodes textually; `stream` invokes the user-installed engine through the todo-6 bridge and prints its events.
+  - Snapshot directory resolves as `--snapshot-dir`, then `$OMO_SNAPSHOT_DIR`, then the OS temp dir default shared with the pane service. Engine-absent streams exit 3 (`MISSING_DEPENDENCY`) with the bridge's degraded message.
+  - Created with `createDagCommand({ setCancelCleanup, createBridge })` so tests inject a stub bridge; the entrypoint passes the real cleanup.
+
 - `commands-schedule.js`
   - Implements scheduled task status/list/create/run/delete/enable/disable.
   - Maps options to control-service inputs and renders results; project resolution, validation, persistence, and execution remain server-owned.
