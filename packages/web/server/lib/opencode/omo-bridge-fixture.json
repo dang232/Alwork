@@ -1,0 +1,98 @@
+{
+  "$comment": "Adapter-A bridge fixture (project-ide todo 6). Wire shapes mirror the engine builders: omo.dag.updated per dag-snapshot-payload.ts dagUpdatedPayload (parent_session_id + runs with snake_case run/node/edge/wave fields) and omo.task.updated per task-rpc-bridge.ts (parent_session_id + tasks). Drives render/snapshot tests with NO engine installed; the pane harness (todo 13) consumes the same file.",
+  "sessionId": "ses_fixture01",
+  "otherSessionId": "ses_other02",
+  "dagUpdated": {
+    "parent_session_id": "ses_fixture01",
+    "runs": [
+      {
+        "run_id": "run_fixture_a",
+        "run_key": "fixture-a",
+        "name": "fixture run a",
+        "status": "running",
+        "created_at": "2026-10-08T08:00:00.000Z",
+        "updated_at": "2026-10-08T08:01:00.000Z",
+        "counts": { "pending": 1, "running": 1, "completed": 1 },
+        "nodes": [
+          {
+            "id": "node_plan",
+            "label": "plan",
+            "prompt": "Plan the fixture migration",
+            "depends_on": [],
+            "state": "completed",
+            "attempt": 1,
+            "created_at": "2026-10-08T08:00:00.000Z",
+            "completed_at": "2026-10-08T08:00:30.000Z"
+          },
+          {
+            "id": "node_build",
+            "label": "build",
+            "prompt": "Build the fixture bridge",
+            "depends_on": ["node_plan"],
+            "state": "running",
+            "attempt": 1,
+            "created_at": "2026-10-08T08:00:30.000Z",
+            "started_at": "2026-10-08T08:00:31.000Z"
+          },
+          {
+            "id": "node_verify",
+            "label": "verify",
+            "prompt": "Verify the fixture bridge",
+            "depends_on": ["node_build"],
+            "state": "pending",
+            "attempt": 0,
+            "created_at": "2026-10-08T08:00:30.000Z"
+          }
+        ],
+        "edges": [{ "from": "node_plan", "to": "node_build" }, { "from": "node_build", "to": "node_verify" }],
+        "waves": [{ "index": 0, "node_ids": ["node_plan"] }, { "index": 1, "node_ids": ["node_build"] }, { "index": 2, "node_ids": ["node_verify"] }]
+      }
+    ]
+  },
+  "dagUpdatedOtherSession": {
+    "parent_session_id": "ses_other02",
+    "runs": [
+      {
+        "run_id": "run_other",
+        "run_key": "other",
+        "name": "another session's run",
+        "status": "running",
+        "created_at": "2026-10-08T08:00:00.000Z",
+        "updated_at": "2026-10-08T08:01:00.000Z",
+        "counts": { "running": 1 },
+        "nodes": [],
+        "edges": [],
+        "waves": []
+      }
+    ]
+  },
+  "taskUpdated": {
+    "parent_session_id": "ses_fixture01",
+    "tasks": [
+      {
+        "task_id": "st_fixture0000000000000001",
+        "status": "running",
+        "name": "fixture child",
+        "task_summary": "Build the fixture bridge",
+        "description": "Child task owned by the fixture session",
+        "agent_type": "task",
+        "category": "unspecified-low",
+        "model": "fixture-model"
+      }
+    ]
+  },
+  "runResult": {
+    "sessionId": "ses_fixture01",
+    "success": true,
+    "durationMs": 1234,
+    "messageCount": 3,
+    "summary": "Fixture run completed"
+  },
+  "malformedLines": [
+    "not json{",
+    "[1,2,3]",
+    "{\"type\":\"omo.dag.updated\"}",
+    "{\"type\":\"omo.unknown.event\",\"data\":{\"parent_session_id\":\"ses_fixture01\"}}",
+    "{\"type\":\"omo.task.updated\",\"data\":{\"parent_session_id\":\"ses_other02\",\"tasks\":[]}}"
+  ]
+}
