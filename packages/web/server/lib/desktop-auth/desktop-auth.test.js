@@ -46,6 +46,7 @@ const createHarness = ({
 } = {}) => {
   const routes = new Map();
   const seenSessions = [];
+  const seenVerified = [];
   const serviceCalls = [];
   const serviceFetch = async (url, init) => {
     serviceCalls.push({ url, init });
@@ -61,6 +62,11 @@ const createHarness = ({
         seenSessions.push(req.body);
         return res.status(200).json({ authenticated: true, alcore: { sub: 'user-1', sid: 'sess-1' } });
       },
+      handleServiceVerifiedSessionCreate: async (req, res, verified) => {
+        seenSessions.push(req.body);
+        seenVerified.push(verified);
+        return res.status(200).json({ authenticated: true, alcore: { sub: verified.sub, sid: verified.sid } });
+      },
     },
     alcoreSecret,
     serviceFetch,
@@ -75,16 +81,22 @@ const createHarness = ({
       tunnelAuthController: { classifyRequestScope: () => tunnelScope },
     },
   );
-  const call = async (method, path, { body, query } = {}) => {
+  const call = async (method, path, { body, query, headers } = {}) => {
     const handlers = routes.get(`${method} ${path}`);
     if (!handlers) throw new Error(`no route ${method} ${path}`);
-    const { res, headers } = mockRes();
-    const req = { body, query: query ?? {} };
+    const { res, headers: resHeaders } = mockRes();
+    const mergedHeaders = { host: '127.0.0.1:57123', ...(headers ?? {}) };
+    const req = {
+      body,
+      query: query ?? {},
+      headers: mergedHeaders,
+      get: (name) => mergedHeaders[String(name).toLowerCase()],
+    };
     // Last handler is the route logic; earlier entries are body-parsing middleware.
     await handlers[handlers.length - 1](req, res);
-    return { res, headers };
+    return { res, headers: resHeaders };
   };
-  return { call, seenSessions, serviceCalls, serviceJson, runtime };
+  return { call, seenSessions, seenVerified, serviceCalls, serviceJson, runtime };
 };
 
 describe('desktop auth config', () => {
@@ -162,17 +174,47 @@ describe('desktop email proxies', () => {
     expect(headers['retry-after']).toBe(42);
   });
 
-  test('refuses session login without a configured Alcore secret before calling the service', async () => {
+  test('confirms the pair with the service when no Alcore secret is configured', async () => {
+    const payload = Buffer.from(JSON.stringify({ sub: 'user-7', sid: 'sess-9' })).toString('base64url');
+    const token = `header.${payload}.sig`;
     const h = createHarness({
       alcoreSecret: '',
-      serviceImpl: async () => h.serviceJson(200, SERVICE_PAIR),
+      serviceImpl: async (url, init) => {
+        if (url === 'https://auth.alcore.io.vn/auth/login') {
+          return h.serviceJson(200, { ...SERVICE_PAIR, access_token: token });
+        }
+        if (url === 'https://auth.alcore.io.vn/auth/me') {
+          expect(init.method).toBe('GET');
+          expect(init.headers.Authorization).toBe(`Bearer ${token}`);
+          return h.serviceJson(200, { id: 'user-7', email: 'a@example.test', emailVerified: true });
+        }
+        throw new Error(`unexpected service call ${url}`);
+      },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 'x', trustDevice: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ authenticated: true });
+    expect(h.seenSessions).toHaveLength(1);
+    expect(h.seenSessions[0]).toMatchObject({ trustDevice: true });
+    expect(h.seenSessions[0].alcoreToken).toBeUndefined();
+    expect(h.seenVerified).toEqual([{ sub: 'user-7', sid: 'sess-9' }]);
+  });
+
+  test('fails closed when the service cannot confirm the pair', async () => {
+    const h = createHarness({
+      alcoreSecret: '',
+      serviceImpl: async (url) => {
+        if (url === 'https://auth.alcore.io.vn/auth/login') return h.serviceJson(200, SERVICE_PAIR);
+        return h.serviceJson(401, { error: 'unauthorized' });
+      },
     });
     const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
       body: { email: 'a@example.test', password: 'x' },
     });
-    expect(res.statusCode).toBe(503);
-    expect(res.body).toEqual({ error: 'alcore_not_configured' });
-    expect(h.serviceCalls).toHaveLength(0);
+    expect(res.statusCode).toBe(502);
+    expect(res.body).toEqual({ error: 'unavailable' });
     expect(h.seenSessions).toHaveLength(0);
   });
 
@@ -268,58 +310,103 @@ describe('desktop email proxies', () => {
   });
 });
 
-describe('desktop google ferry', () => {
+describe('desktop google loopback', () => {
+  const LOOPBACK_REDIRECT = 'http://127.0.0.1:57123/auth/desktop-google/callback';
+
   const startOk = async (h) => {
     const started = await h.call('POST', '/api/auth/desktop/google/start', { body: {} });
     expect(started.res.statusCode).toBe(200);
-    expect(started.res.body.requestId).toMatch(/^[0-9a-f]{32}$/);
-    expect(started.res.body.pageUrl).toBe(`/auth/desktop-google?requestId=${started.res.body.requestId}`);
-    return started.res.body.requestId;
+    const { requestId, googleUrl } = started.res.body;
+    expect(requestId).toMatch(/^[0-9a-f]{32}$/);
+    expect(started.res.body.pageUrl).toBeUndefined();
+    const parsed = new URL(googleUrl);
+    expect(parsed.origin).toBe('https://accounts.google.com');
+    expect(parsed.pathname).toBe('/o/oauth2/v2/auth');
+    expect(parsed.searchParams.get('client_id')).toBe('google-client-123');
+    expect(parsed.searchParams.get('redirect_uri')).toBe(LOOPBACK_REDIRECT);
+    expect(parsed.searchParams.get('response_type')).toBe('code');
+    expect(parsed.searchParams.get('state')).toBe(requestId);
+    expect(parsed.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(parsed.searchParams.get('code_challenge') ?? '').toMatch(/^[A-Za-z0-9-_]{43}$/);
+    expect(parsed.searchParams.get('nonce') ?? '').toMatch(/^[0-9a-f]{32}$/);
+    return { requestId };
   };
 
-  test('serves a GIS page bound to the request', async () => {
+  const okJson = (data) => ({ status: 200, json: async () => data });
+
+  const configService = () => async (url) => {
+    expect(url).toBe('https://auth.alcore.io.vn/auth/google/config');
+    return okJson({ clientId: 'google-client-123' });
+  };
+
+  const exchangeService = (seen) => async (url, init) => {
+    if (url === 'https://auth.alcore.io.vn/auth/google/config') {
+      return okJson({ clientId: 'google-client-123' });
+    }
+    expect(url).toBe('https://auth.alcore.io.vn/auth/google/desktop-code');
+    const body = JSON.parse(init.body);
+    expect(body.code).toBe('loopback-code');
+    expect(body.redirect_uri).toBe(LOOPBACK_REDIRECT);
+    expect(body.code_verifier).toMatch(/^[A-Za-z0-9\-._~]{43}$/);
+    expect(body.nonce).toMatch(/^[0-9a-f]{32}$/);
+    seen.push(body);
+    return okJson({ access_token: 'desktop-access-token' });
+  };
+
+  test('fails fast when Google is not configured', async () => {
     const h = createHarness({
-      serviceImpl: async (url) => {
-        expect(url).toBe('https://auth.alcore.io.vn/auth/google/config');
-        return h.serviceJson(200, { clientId: 'google-client-123' });
-      },
+      serviceImpl: async () => h.serviceJson(200, { clientId: '' }),
     });
-    const requestId = await startOk(h);
-    const { res } = await h.call('GET', '/auth/desktop-google', { query: { requestId } });
-    expect(res.statusCode).toBe(200);
-    expect(res.text).toContain('https://accounts.google.com/gsi/client');
-    expect(res.text).toContain('google-client-123');
-    expect(res.text).toContain(requestId);
-    expect(res.text).not.toContain('</script><script');
+    const { res } = await h.call('POST', '/api/auth/desktop/google/start', { body: {} });
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({ error: 'google_not_configured' });
   });
 
-  test('rejects unknown and malformed page links', async () => {
-    const h = createHarness({ serviceImpl: async () => h.serviceJson(200, { clientId: 'x' }) });
-    const bad = await h.call('GET', '/auth/desktop-google', { query: { requestId: 'nope' } });
-    expect(bad.res.statusCode).toBe(400);
-    const unknown = await h.call('GET', '/auth/desktop-google', { query: { requestId: 'a'.repeat(32) } });
-    expect(unknown.res.statusCode).toBe(410);
+  test('refuses non-loopback and missing hosts instead of minting a redirect', async () => {
+    const h = createHarness({ serviceImpl: configService() });
+    for (const headers of [{ host: 'example.com:443' }, { host: '' }, { host: undefined }]) {
+      const { res } = await h.call('POST', '/api/auth/desktop/google/start', { body: {}, headers });
+      expect(res.statusCode).toBe(500);
+    }
+    expect(h.serviceCalls).toHaveLength(1);
   });
 
-  test('captures once and completes into a session', async () => {
-    const h = createHarness({
-      serviceImpl: async (url, init) => {
-        expect(url).toBe('https://auth.alcore.io.vn/auth/google/verify');
-        expect(JSON.parse(init.body)).toEqual({ idToken: 'google-id-token' });
-        return h.serviceJson(200, SERVICE_PAIR);
-      },
-    });
-    const requestId = await startOk(h);
-    const captured = await h.call('POST', '/api/auth/desktop/google-capture', {
-      body: { requestId, idToken: 'google-id-token' },
-    });
-    expect(captured.res.statusCode).toBe(200);
-    expect(captured.res.body).toEqual({ ok: true });
+  test('rejects malformed, declined, and unknown callbacks without exchanging', async () => {
+    const h = createHarness({ serviceImpl: configService() });
+    const { requestId } = await startOk(h);
+    const callsBefore = h.serviceCalls.length;
+    for (const [query, status] of [
+      [{}, 400],
+      [{ state: 'nope', code: 'x' }, 400],
+      [{ state: requestId }, 400],
+      [{ state: requestId, code: 'x', error: 'access_denied' }, 400],
+      [{ state: 'b'.repeat(32), code: 'x' }, 410],
+    ]) {
+      const { res } = await h.call('GET', '/auth/desktop-google/callback', { query });
+      expect(res.statusCode).toBe(status);
+      expect(res.text).toContain('Sign in with Google');
+    }
+    expect(h.serviceCalls).toHaveLength(callsBefore);
+  });
 
-    const replay = await h.call('POST', '/api/auth/desktop/google-capture', {
-      body: { requestId, idToken: 'google-id-token' },
+  test('captures the loopback code once and completes into a session', async () => {
+    const seen = [];
+    const h = createHarness({ serviceImpl: exchangeService(seen) });
+    const { requestId } = await startOk(h);
+
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
     });
-    expect(replay.res.statusCode).toBe(404);
+    expect(landed.res.statusCode).toBe(200);
+    expect(landed.res.text).toContain('return to the OpenChamber app');
+    expect(seen).toHaveLength(1);
+
+    // Double navigation after capture: idempotent success, no second exchange.
+    const replay = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(replay.res.statusCode).toBe(200);
+    expect(seen).toHaveLength(1);
 
     const done = await h.call('POST', '/api/auth/desktop/google-complete', {
       body: { requestId, trustDevice: true, issueClientToken: true, clientLabel: 'OpenChamber Desktop' },
@@ -327,7 +414,7 @@ describe('desktop google ferry', () => {
     expect(done.res.statusCode).toBe(200);
     expect(h.seenSessions).toHaveLength(1);
     expect(h.seenSessions[0]).toMatchObject({
-      alcoreToken: 'svc-access-token',
+      alcoreToken: 'desktop-access-token',
       trustDevice: true,
       issueClientToken: true,
       clientLabel: 'OpenChamber Desktop',
@@ -338,47 +425,108 @@ describe('desktop google ferry', () => {
     expect(h.seenSessions).toHaveLength(1);
   });
 
-  test('completing without a capture waits with 404 and never calls the service', async () => {
-    const h = createHarness({
-      serviceImpl: async () => h.serviceJson(200, SERVICE_PAIR),
-    });
-    const requestId = await startOk(h);
+  test('completing before the callback waits with 404 and never exchanges', async () => {
+    const h = createHarness({ serviceImpl: configService() });
+    const { requestId } = await startOk(h);
+    const callsBefore = h.serviceCalls.length;
     const { res } = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
     expect(res.statusCode).toBe(404);
     expect(res.body).toEqual({ error: 'no_credential' });
-    expect(h.serviceCalls).toHaveLength(0);
+    expect(h.serviceCalls).toHaveLength(callsBefore);
   });
 
-  test('maps a rejected Google credential to its status', async () => {
-    for (const [serviceStatus, serviceBody] of [
-      [401, { error: 'invalid_credentials' }],
-      [409, { error: 'identity_conflict' }],
+  test('maps a refused exchange to the failure page and drops the request', async () => {
+    for (const [serviceStatus, serviceBody, pageStatus] of [
+      [401, { error: 'invalid_google_credential' }, 401],
+      [409, { error: 'identity_conflict' }, 409],
+      [503, { error: 'google_not_configured' }, 503],
     ]) {
       const h = createHarness({
-        serviceImpl: async () => h.serviceJson(serviceStatus, serviceBody),
+        serviceImpl: async (url) => {
+          if (url.endsWith('/auth/google/config')) return h.serviceJson(200, { clientId: 'google-client-123' });
+          return h.serviceJson(serviceStatus, serviceBody);
+        },
       });
-      const requestId = await startOk(h);
-      await h.call('POST', '/api/auth/desktop/google-capture', {
-        body: { requestId, idToken: 'stale-google-token' },
+      const { requestId } = await startOk(h);
+      const landed = await h.call('GET', '/auth/desktop-google/callback', {
+        query: { state: requestId, code: 'loopback-code' },
       });
+      expect(landed.res.statusCode).toBe(pageStatus);
+      expect(landed.res.text).toContain('Sign in with Google');
       const { res } = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
-      expect(res.statusCode).toBe(serviceStatus);
-      expect(res.body).toEqual(serviceBody);
+      expect(res.statusCode).toBe(404);
       expect(h.seenSessions).toHaveLength(0);
     }
   });
 
-  test('rejects malformed ferry bodies', async () => {
+  test('answers an unreachable service at the callback without a session', async () => {
+    const h = createHarness({
+      serviceImpl: async (url) => {
+        if (url.endsWith('/auth/google/config')) return h.serviceJson(200, { clientId: 'google-client-123' });
+        throw new Error('down');
+      },
+    });
+    const { requestId } = await startOk(h);
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(502);
+    const { res } = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(res.statusCode).toBe(404);
+  });
+
+  test('completes without a local secret via service introspection', async () => {
+    const payload = Buffer.from(JSON.stringify({ sub: 'user-9', sid: 'sess-9' })).toString('base64url');
+    const token = `header.${payload}.sig`;
+    const h = createHarness({
+      alcoreSecret: '',
+      serviceImpl: async (url, init) => {
+        if (url === 'https://auth.alcore.io.vn/auth/google/config') {
+          return h.serviceJson(200, { clientId: 'google-client-123' });
+        }
+        if (url === 'https://auth.alcore.io.vn/auth/google/desktop-code') {
+          return h.serviceJson(200, { access_token: token });
+        }
+        if (url === 'https://auth.alcore.io.vn/auth/me') {
+          expect(init.headers.Authorization).toBe(`Bearer ${token}`);
+          return h.serviceJson(200, { id: 'user-9', email: 'g@example.test', emailVerified: true });
+        }
+        throw new Error(`unexpected service call ${url}`);
+      },
+    });
+    const { requestId } = await startOk(h);
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(200);
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    expect(done.res.body).toMatchObject({ authenticated: true });
+    expect(h.seenVerified).toEqual([{ sub: 'user-9', sid: 'sess-9' }]);
+  });
+
+  test('rejects malformed complete bodies', async () => {
     const h = createHarness({ serviceImpl: async () => h.serviceJson(200, SERVICE_PAIR) });
-    for (const [method, path, body] of [
-      ['POST', '/api/auth/desktop/google-capture', {}],
-      ['POST', '/api/auth/desktop/google-capture', { requestId: 'short', idToken: 'x' }],
-      ['POST', '/api/auth/desktop/google-complete', {}],
-    ]) {
-      const { res } = await h.call(method, path, { body });
+    for (const body of [{}, { requestId: 'short' }]) {
+      const { res } = await h.call('POST', '/api/auth/desktop/google-complete', { body });
       expect(res.statusCode).toBe(400);
     }
     expect(h.serviceCalls).toHaveLength(0);
+  });
+
+  test('leaves the loopback callback public for the system browser under tunnel scope', async () => {
+    const h = createHarness({
+      tunnelScope: 'tunnel',
+      serviceImpl: async () => h.serviceJson(200, SERVICE_PAIR),
+    });
+    // Start stays refused for tunnel scope; the callback itself answers the
+    // browser navigation (unknown states fail closed, never 403-locked).
+    const refused = await h.call('POST', '/api/auth/desktop/google/start', { body: {} });
+    expect(refused.res.statusCode).toBe(403);
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: 'b'.repeat(32), code: 'x' },
+    });
+    expect(landed.res.statusCode).toBe(410);
   });
 });
 
@@ -394,7 +542,6 @@ describe('desktop auth tunnel scope', () => {
       ['POST', '/api/auth/desktop/email/verify-otp', { body: { email: 'a@example.test', code: '1' } }],
       ['POST', '/api/auth/desktop/email/otp-resend', { body: { email: 'a@example.test' } }],
       ['POST', '/api/auth/desktop/google/start', { body: {} }],
-      ['POST', '/api/auth/desktop/google-capture', { body: { requestId: 'a'.repeat(32), idToken: 'x' } }],
       ['POST', '/api/auth/desktop/google-complete', { body: { requestId: 'a'.repeat(32) } }],
     ]) {
       const { res } = await h.call(method, path, body);

@@ -9,23 +9,30 @@
 //   `POST /auth/session {alcoreToken}` shape and delegated to
 //   `uiAuthController.handleSessionCreate`, so session issuance, cookies,
 //   rate limiting, and client tokens stay on the one code path that owns them.
-// - Google: the system browser opens a loopback GIS page served here; the
-//   Google credential returns to the loopback capture endpoint and the app
-//   completes the login by polling. The renderer never sees credentials, and
-//   no service URL is hardcoded in UI code (the server derives it from the
-//   Alcore issuer it already verifies against).
+// - Google: the system browser opens Google's OAuth authorize page directly
+//   (plain redirect, never the GIS JavaScript flow whose authorized origins
+//   cannot cover dynamic loopback ports). Google returns the authorization
+//   code to the loopback callback served here; this server redeems it at the
+//   service's existing `POST /auth/google/desktop-code` endpoint (the
+//   confidential secret never leaves the service) and the app completes the
+//   login by polling. The renderer never sees credentials, and no service
+//   URL is hardcoded in UI code (the server derives it from the Alcore
+//   issuer it already verifies against).
 //
-// Privacy: request bodies may carry passwords and ID tokens. Nothing here
-// logs them. Service `Set-Cookie` headers are never forwarded: every handler
-// answers with its own `res.status().json()`, so no upstream header survives.
-import { randomBytes } from 'node:crypto';
+// Privacy: request bodies may carry passwords and authorization codes.
+// Nothing here logs them. Service `Set-Cookie` headers are never forwarded:
+// every handler answers with its own `res.status().json()`, so no upstream
+// header survives.
+import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
 
 import { readAlcoreIssuer, readAlcoreKeys } from '../ui-auth/ui-auth.js';
 
 const SERVICE_TIMEOUT_MS = 15_000;
-const GOOGLE_CAPTURE_TTL_MS = 5 * 60 * 1000;
+const GOOGLE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const GOOGLE_CLIENT_CACHE_TTL_MS = 10 * 60 * 1000;
+const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const DESKTOP_GOOGLE_CALLBACK_PATH = '/auth/desktop-google/callback';
 const JSON_BODY_LIMIT = '64kb';
 
 const defaultServiceBase = () => {
@@ -52,7 +59,17 @@ const emailSchema = z.string().trim().toLowerCase().min(3).max(254);
 const passwordSchema = z.string().min(1).max(512);
 const codeSchema = z.string().trim().min(1).max(64);
 const requestIdSchema = z.string().regex(/^[0-9a-f]{32}$/);
-const idTokenSchema = z.string().min(1).max(8192);
+const nonEmptyStringSchema = z.string().min(1);
+// Service and browser payloads are parsed with these schemas at their
+// boundaries instead of ad-hoc type narrowing.
+const servicePairSchema = z.object({ access_token: nonEmptyStringSchema });
+const serviceMeSchema = z.object({ id: nonEmptyStringSchema });
+const tokenSidSchema = z.object({ sid: z.string() });
+const desktopCallbackQuerySchema = z.object({
+  state: z.string(),
+  code: z.string().optional(),
+  error: z.string().optional(),
+});
 const booleanSchema = z.boolean().optional();
 
 const sessionFieldsSchema = z.object({
@@ -86,11 +103,6 @@ const emailOtpResendSchema = z.object({
   email: emailSchema,
 });
 
-const googleCaptureSchema = z.object({
-  requestId: requestIdSchema,
-  idToken: idTokenSchema,
-});
-
 const googleCompleteSchema = z.object({
   requestId: requestIdSchema,
 }).merge(sessionFieldsSchema);
@@ -117,9 +129,9 @@ export const createDesktopAuthRuntime = ({
     }
   };
 
-  // Session-issuing handlers fail fast here so a login attempt never spends
-  // a service round trip (and never sends the user's credential onward) when
-  // this server could not verify the resulting pair anyway.
+  // Whether this server can verify Alcore tokens locally. Servers without
+  // a shared secret (packaged desktop) convert service pairs through
+  // service introspection instead (see completeWithServicePair).
 
   const sweepGoogle = () => {
     const at = now();
@@ -168,22 +180,70 @@ export const createDesktopAuthRuntime = ({
 
   // Convert a service session pair into an IDE UI session through the one
   // login path that owns cookies, TTLs, and client tokens. Fails closed when
-  // this server cannot verify Alcore tokens (no shared secret configured).
-  const completeWithServicePair = (req, res, pair, sessionOpts) => {
-    if (!hasAlcoreSecret()) {
-      return res.status(503).json({ error: 'alcore_not_configured' });
-    }
-    const token = pair && typeof pair.access_token === 'string' ? pair.access_token.trim() : '';
+  // this server could not verify Alcore tokens (no shared secret configured).
+  const completeWithServicePair = async (req, res, pair, sessionOpts) => {
+    const parsedPair = servicePairSchema.safeParse(pair);
+    const token = parsedPair.success ? parsedPair.data.access_token.trim() : '';
     if (token === '') {
       return res.status(502).json({ error: 'unavailable' });
     }
-    req.body = {
-      alcoreToken: token,
-      ...(sessionOpts.trustDevice === true ? { trustDevice: true } : {}),
-      ...(sessionOpts.issueClientToken === true ? { issueClientToken: true } : {}),
-      ...optionalSessionFields(sessionOpts),
-    };
-    return uiAuthController.handleSessionCreate(req, res);
+    if (hasAlcoreSecret()) {
+      req.body = sessionBodyOf(sessionOpts, { alcoreToken: token });
+      return uiAuthController.handleSessionCreate(req, res);
+    }
+    // Packaged desktop: no shared secret is available (and none is shipped
+    // in the app), so the pair is confirmed live against the service itself
+    // before the local session is issued. An unreachable or unconfirming
+    // service fails closed — never a session.
+    if (uiAuthController.handleServiceVerifiedSessionCreate === undefined) {
+      return res.status(503).json({ error: 'alcore_not_configured' });
+    }
+    const confirmed = await introspectServicePair(token);
+    if (!confirmed || confirmed.sid === '') {
+      return res.status(502).json({ error: 'unavailable' });
+    }
+    req.body = sessionBodyOf(sessionOpts, {});
+    return uiAuthController.handleServiceVerifiedSessionCreate(req, res, confirmed);
+  };
+
+  // Session login body: optional flags are added only when present, so an
+  // absent flag and an explicit false stay distinct downstream.
+  const sessionBodyOf = (sessionOpts, extra) => {
+    const body = { ...extra, ...optionalSessionFields(sessionOpts) };
+    if (sessionOpts.trustDevice === true) body.trustDevice = true;
+    if (sessionOpts.issueClientToken === true) body.issueClientToken = true;
+    return body;
+  };
+
+  // GET /auth/me token introspection: proves the service pair is live and
+  // yields the authoritative subject. The sid rides along unverified from
+  // the token payload (informational, for the session response); trust comes
+  // from the service's 200, not from local parsing.
+  const introspectServicePair = async (token) => {
+    try {
+      const response = await serviceFetch(`${serviceBase}/auth/me`, {
+        method: 'GET',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(SERVICE_TIMEOUT_MS),
+      });
+      const data = await response.json().catch(() => null);
+      const parsedMe = serviceMeSchema.safeParse(data);
+      const sub = parsedMe.success ? parsedMe.data.id.trim() : '';
+      if (response.status !== 200 || sub === '') return null;
+      return { sub, sid: decodeAccessTokenSid(token) };
+    } catch {
+      return null;
+    }
+  };
+
+  const decodeAccessTokenSid = (token) => {
+    try {
+      const payload = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+      const parsedSid = tokenSidSchema.safeParse(payload);
+      return parsedSid.success ? parsedSid.data.sid.trim() : '';
+    } catch {
+      return '';
+    }
   };
 
   const optionalSessionFields = (opts) => {
@@ -216,50 +276,87 @@ export const createDesktopAuthRuntime = ({
     return '';
   };
 
-  const escapeJsonForHtml = (value) => JSON.stringify(value).replace(/</g, '\\u003c');
+  const base64Url = (bytes) => Buffer.from(bytes).toString('base64url');
 
-  const googlePage = (requestId, clientId) => `<!doctype html>
+  // PKCE (S256) for the loopback hop: the verifier never leaves this server
+  // except inside the confidential service exchange.
+  const mintPkce = () => {
+    const verifier = base64Url(randomBytes(32));
+    const challenge = base64Url(createHash('sha256').update(verifier, 'utf8').digest());
+    return { verifier, challenge };
+  };
+
+  const readRequestHost = (req) => {
+    const candidates = [];
+    try {
+      candidates.push(req?.get?.('host'));
+    } catch {
+      candidates.push(undefined);
+    }
+    candidates.push(req?.headers?.host, req?.headers?.[':authority']);
+    for (const candidate of candidates) {
+      const parsed = z.string().min(1).safeParse(candidate);
+      if (parsed.success) {
+        const trimmed = parsed.data.trim();
+        if (trimmed !== '') return trimmed;
+      }
+    }
+    return '';
+  };
+
+  // The loopback redirect target for THIS server, derived from the request's
+  // own Host (the port is dynamic per launch). Only loopback hosts qualify
+  // and the result is always normalized to 127.0.0.1, so this URL can never
+  // become an open redirector and always matches the service allowlist.
+  const resolveLoopbackRedirectUri = (req) => {
+    const match = /^(localhost|127\.0\.0\.1|\[::1\])(:(\d{1,5}))?$/.exec(readRequestHost(req));
+    const port = match?.[3] !== undefined ? Number(match[3]) : NaN;
+    if (!match || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+    return `http://127.0.0.1:${port}${DESKTOP_GOOGLE_CALLBACK_PATH}`;
+  };
+
+  const callbackPage = (title, heading, message, done) => `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in with Google — OpenChamber</title>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
-<style>body{font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;background:#131110;color:#fafaf9}.card{text-align:center;max-width:22rem;padding:2rem}#status{margin-top:1rem;min-height:1.5rem;color:#a8a29e}#done{color:#4ade80}</style>
+<title>${title} — OpenChamber</title>
+<style>body{font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;background:#131110;color:#fafaf9}.card{text-align:center;max-width:24rem;padding:2rem}#done{color:#4ade80}p{color:#a8a29e}</style>
 </head>
 <body><div class="card">
-<h1>Sign in with Google</h1>
-<p>Choose the Google account for OpenChamber Desktop.</p>
-<div id="button"></div>
-<p id="status" role="status"></p>
-</div><script>
-const CONTEXT = ${escapeJsonForHtml({ requestId, clientId })};
-const statusEl = document.getElementById('status');
-const say = (text, done) => { statusEl.textContent = text; if (done) statusEl.id = 'done'; };
-async function onCredential(response) {
-  const credential = response && response.credential ? String(response.credential) : '';
-  if (!credential) { say('Google did not return a credential. Close this tab and try again.'); return; }
-  say('Verifying…');
-  try {
-    const res = await fetch('/api/auth/desktop/google-capture', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ requestId: CONTEXT.requestId, idToken: credential }),
-    });
-    if (!res.ok) throw new Error('capture ' + res.status);
-    say('Signed in — return to the OpenChamber app.', true);
-  } catch (error) {
-    say('Could not reach the app. Keep it open and try again.');
-  }
-}
-function boot() {
-  if (!window.google || !google.accounts || !google.accounts.id) { setTimeout(boot, 200); return; }
-  try {
-    google.accounts.id.initialize({ client_id: CONTEXT.clientId, callback: onCredential });
-    google.accounts.id.renderButton(document.getElementById('button'), { theme: 'filled_black', size: 'large', width: 280 });
-  } catch (error) {
-    say('Google sign-in failed to start. Close this tab and try again.');
-  }
-}
-boot();
-</script></body></html>`;
+<h1>${heading}</h1>
+<p${done ? ' id="done"' : ''}>${message}</p>
+</div></body></html>`;
+
+  const callbackSuccessPage = () => callbackPage(
+    'Signed in',
+    'Sign in with Google',
+    'Signed in — return to the OpenChamber app.',
+    true,
+  );
+
+  const callbackFailurePage = (status) => {
+    if (status === 503) {
+      return callbackPage(
+        'Sign-in unavailable',
+        'Sign in with Google',
+        'Google login is not configured right now. Close this tab and try again later.',
+        false,
+      );
+    }
+    if (status === 409) {
+      return callbackPage(
+        'Sign-in conflict',
+        'Sign in with Google',
+        'This Google account is linked to a different sign-in. Close this tab and try another account.',
+        false,
+      );
+    }
+    return callbackPage(
+      'Sign-in failed',
+      'Sign in with Google',
+      'Google sign-in did not complete. Close this tab and restart Google login from the app.',
+      false,
+    );
+  };
 
   const registerRoutes = ({ get, post }, { express, tunnelAuthController }) => {
     const json = express.json({ limit: JSON_BODY_LIMIT });
@@ -272,7 +369,9 @@ boot();
 
     post('/api/auth/desktop/email/login', json, async (req, res) => {
       if (isTunnelScope(tunnelAuthController, req)) return tunnelRefusal(res, 'Email login');
-      if (!hasAlcoreSecret()) return res.status(503).json({ error: 'alcore_not_configured' });
+      // No fail-fast on the Alcore secret here: servers without one confirm
+      // the resulting pair against the service itself (see
+      // completeWithServicePair), so the credential send below is purposeful.
       const parsed = emailLoginSchema.safeParse(req?.body);
       if (!parsed.success) return badRequest(res, 'invalid_request');
       let service;
@@ -302,7 +401,8 @@ boot();
 
     post('/api/auth/desktop/email/verify-otp', json, async (req, res) => {
       if (isTunnelScope(tunnelAuthController, req)) return tunnelRefusal(res, 'Email verification');
-      if (!hasAlcoreSecret()) return res.status(503).json({ error: 'alcore_not_configured' });
+      // Same as email login: the pair converts via service introspection
+      // when no local secret is configured.
       const parsed = emailVerifyOtpSchema.safeParse(req?.body);
       if (!parsed.success) return badRequest(res, 'invalid_request');
       let service;
@@ -332,68 +432,117 @@ boot();
 
     post('/api/auth/desktop/google/start', json, async (req, res) => {
       if (isTunnelScope(tunnelAuthController, req)) return tunnelRefusal(res, 'Google login');
-      sweepGoogle();
-      const requestId = randomBytes(16).toString('hex');
-      pendingGoogle.set(requestId, { idToken: null, expiresAt: now() + GOOGLE_CAPTURE_TTL_MS });
-      res.setHeader('Cache-Control', 'no-store');
-      res.json({ requestId, pageUrl: `/auth/desktop-google?requestId=${requestId}` });
-    });
-
-    get('/auth/desktop-google', async (req, res) => {
-      const requestId = typeof req?.query?.requestId === 'string' ? req.query.requestId : '';
-      if (!requestIdSchema.safeParse(requestId).success) {
-        return res.status(400).send('Invalid sign-in link. Restart Google login from the app.');
-      }
-      sweepGoogle();
-      const pending = pendingGoogle.get(requestId);
-      if (!pending) {
-        return res.status(410).send('This sign-in link expired. Restart Google login from the app.');
-      }
       const clientId = await fetchGoogleClientId();
       if (clientId === '') {
-        return res.status(503).send('Google login is not configured. Restart Google login from the app later.');
+        return res.status(503).json({ error: 'google_not_configured' });
       }
+      const redirectUri = resolveLoopbackRedirectUri(req);
+      if (redirectUri === null) {
+        return res.status(500).json({ error: 'internal' });
+      }
+      sweepGoogle();
+      const requestId = randomBytes(16).toString('hex');
+      const { verifier, challenge } = mintPkce();
+      const nonce = randomBytes(16).toString('hex');
+      pendingGoogle.set(requestId, {
+        verifier,
+        nonce,
+        redirectUri,
+        pair: null,
+        expiresAt: now() + GOOGLE_REQUEST_TTL_MS,
+      });
+      const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'openid email profile',
+        state: requestId,
+        nonce,
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+        prompt: 'select_account',
+      });
       res.setHeader('Cache-Control', 'no-store');
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.send(googlePage(requestId, clientId));
+      res.json({ requestId, googleUrl: `${GOOGLE_AUTHORIZE_URL}?${params.toString()}` });
     });
 
-    post('/api/auth/desktop/google-capture', json, async (req, res) => {
-      if (isTunnelScope(tunnelAuthController, req)) return tunnelRefusal(res, 'Google login');
-      const parsed = googleCaptureSchema.safeParse(req?.body);
-      if (!parsed.success) return badRequest(res, 'invalid_request');
-      sweepGoogle();
-      const pending = pendingGoogle.get(parsed.data.requestId);
-      if (!pending || pending.idToken !== null) {
-        return res.status(404).json({ error: 'unknown_request' });
+    // Loopback OAuth callback (system-browser navigation, no credentials):
+    // validates the state this server minted, redeems the code at the
+    // service where the secret lives, and holds the pair for the app poll.
+    // Stays public like the page it replaces — the system browser sends no
+    // auth headers, and unknown states fail closed before any exchange.
+    get('/auth/desktop-google/callback', async (req, res) => {
+      const parsedQuery = desktopCallbackQuerySchema.safeParse(req?.query ?? {});
+      const state = parsedQuery.success ? parsedQuery.data.state : '';
+      const code = parsedQuery.success && parsedQuery.data.code !== undefined ? parsedQuery.data.code : '';
+      const googleError = parsedQuery.success && parsedQuery.data.error !== undefined ? parsedQuery.data.error : '';
+      if (googleError !== '') {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(400).send(callbackFailurePage(401));
       }
-      pending.idToken = parsed.data.idToken;
+      if (!requestIdSchema.safeParse(state).success || code === '' || code.length > 2048) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(400).send(callbackFailurePage(401));
+      }
+      sweepGoogle();
+      const pending = pendingGoogle.get(state);
+      if (!pending) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(410).send(callbackFailurePage(401));
+      }
+      if (pending.pair !== null) {
+        // Double navigation after a captured code: idempotent success.
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.send(callbackSuccessPage());
+      }
+      let exchange;
+      try {
+        exchange = await callAuthService('/auth/google/desktop-code', {
+          code,
+          redirect_uri: pending.redirectUri,
+          code_verifier: pending.verifier,
+          nonce: pending.nonce,
+        });
+      } catch {
+        pendingGoogle.delete(state);
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(502).send(callbackFailurePage(503));
+      }
+      const parsedToken = exchange.status === 200
+        ? servicePairSchema.safeParse(exchange.data)
+        : null;
+      const accessToken = parsedToken && parsedToken.success ? parsedToken.data.access_token.trim() : '';
+      if (accessToken === '') {
+        pendingGoogle.delete(state);
+        const pageStatus = exchange.status === 503 ? 503 : exchange.status === 409 ? 409 : 401;
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(pageStatus).send(callbackFailurePage(pageStatus));
+      }
+      pending.pair = accessToken;
       res.setHeader('Cache-Control', 'no-store');
-      res.json({ ok: true });
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(callbackSuccessPage());
     });
 
     post('/api/auth/desktop/google-complete', json, async (req, res) => {
       if (isTunnelScope(tunnelAuthController, req)) return tunnelRefusal(res, 'Google login');
-      if (!hasAlcoreSecret()) return res.status(503).json({ error: 'alcore_not_configured' });
       const parsed = googleCompleteSchema.safeParse(req?.body);
       if (!parsed.success) return badRequest(res, 'invalid_request');
       sweepGoogle();
       const pending = pendingGoogle.get(parsed.data.requestId);
-      // Single-use: consume before verifying so a replay races nothing.
+      // Single-use: consume before issuing so a replay races nothing.
       if (pending) pendingGoogle.delete(parsed.data.requestId);
-      if (!pending || pending.idToken === null) {
+      const parsedPair = servicePairSchema.safeParse({ access_token: pending?.pair });
+      if (!pending || !parsedPair.success || parsedPair.data.access_token.trim() === '') {
         return res.status(404).json({ error: 'no_credential' });
       }
-      let service;
-      try {
-        service = await callAuthService('/auth/google/verify', { idToken: pending.idToken });
-      } catch {
-        return res.status(502).json({ error: 'unavailable' });
-      }
-      if (service.status === 200) {
-        return completeWithServicePair(req, res, service.data, sessionOptsOf(parsed.data));
-      }
-      return passthroughStatus(res, service.status, service.data, 'invalid_request');
+      return completeWithServicePair(req, res, { access_token: parsedPair.data.access_token.trim() }, sessionOptsOf(parsed.data));
     });
   };
 

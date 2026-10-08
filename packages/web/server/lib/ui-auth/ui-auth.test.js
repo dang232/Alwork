@@ -438,6 +438,64 @@ describe('ui auth client credential seam', () => {
   });
 });
 
+describe('ui auth service-verified session seam', () => {
+  // Each attempt gets its own connection address: the login limiter is
+  // module-global, and sharing the no-IP bucket would trip it across cases.
+  const sock = (n) => ({ remoteAddress: `10.9.0.${n}` });
+
+  it('issues a session for a service-confirmed identity without a local secret', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreIssuer: ALCORE_TEST_ISSUER });
+    const req = { method: 'POST', headers: {}, socket: sock(11), body: { trustDevice: false } };
+    const res = createResponse();
+
+    await auth.handleServiceVerifiedSessionCreate(req, res, { sub: 'user-9', sid: 'sess-9' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ authenticated: true, alcore: { sub: 'user-9', sid: 'sess-9' } });
+    expect(String(res.getHeader('set-cookie') || '')).toContain('oc_ui_session');
+  });
+
+  it('fails closed on malformed identities without touching the session', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreIssuer: ALCORE_TEST_ISSUER });
+    let n = 20;
+    for (const verified of [null, undefined, {}, { sub: '', sid: '' }, { sub: 'user-9' }, { sid: 'sess-9' }]) {
+      const res = createResponse();
+      await auth.handleServiceVerifiedSessionCreate(
+        { method: 'POST', headers: {}, socket: sock(n++), body: {} },
+        res,
+        verified,
+      );
+      expect(res.statusCode).toBe(401);
+      expect(res.body).toEqual({ error: 'Invalid credentials' });
+    }
+  });
+
+  it('keeps client-token issuance on the service-verified path', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    let createClientInput = null;
+    const auth = createUiAuth({
+      alcoreIssuer: ALCORE_TEST_ISSUER,
+      clientAuthController: {
+        createClient: async (input) => {
+          createClientInput = input;
+          return { token: 'client-token', client: { id: 'c1' } };
+        },
+      },
+    });
+    const res = createResponse();
+    await auth.handleServiceVerifiedSessionCreate(
+      { method: 'POST', headers: {}, socket: sock(30), body: { issueClientToken: true, clientLabel: 'OpenChamber Desktop' } },
+      res,
+      { sub: 'user-9', sid: 'sess-9' },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.body.clientToken).toBe('client-token');
+    expect(createClientInput).toMatchObject({ fallbackLabel: 'OpenChamber Desktop', authMethod: 'alcore' });
+  });
+});
+
 // issue #2377: browsers key cookie jars on host only, so two instances on one
 // LAN IP (different ports) collided on `oc_ui_session`. Cookies are now scoped
 // by the request port so each instance owns its own slot.

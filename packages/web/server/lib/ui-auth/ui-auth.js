@@ -546,6 +546,11 @@ const alcoreLoginBodySchema = z.object({
   token: z.string().optional(),
 });
 
+const serviceVerifiedIdentitySchema = z.object({
+  sub: z.string(),
+  sid: z.string(),
+});
+
 const readAlcoreLoginToken = (req) => {
   const body = alcoreLoginBodySchema.safeParse(req?.body).data;
   const candidates = [body?.alcoreToken, body?.accessToken, body?.token];
@@ -942,6 +947,14 @@ export const createUiAuth = ({
       return;
     }
 
+    await issueVerifiedAlcoreSession(req, res, alcore);
+  };
+
+  // Shared issuance tail for verified Alcore identities: session cookie,
+  // TTLs, and optional client tokens stay on this one path no matter how
+  // the identity was verified (local HMAC above, service introspection in
+  // the desktop login below).
+  const issueVerifiedAlcoreSession = async (req, res, alcore) => {
     await clearRateLimit(req);
 
     const trustDevice = isTrustedDeviceRequest(req.body?.trustDevice);
@@ -967,6 +980,40 @@ export const createUiAuth = ({
       alcore: { sub: alcore.sub, sid: alcore.sid },
       ...(clientTokenResult?.token ? { clientToken: clientTokenResult.token, client: clientTokenResult.client } : {}),
     });
+  };
+
+  // Desktop login without a local Alcore secret (packaged app): the caller
+  // confirmed the service pair against the service itself (GET /auth/me
+  // introspection over the service TLS connection) and passes the confirmed
+  // identity in. Same rate limits and issuance as the local-verify path;
+  // malformed identities fail closed without touching the session.
+  const handleServiceVerifiedSessionCreate = async (req, res, verified) => {
+    const rateLimitResult = await checkRateLimit(req);
+
+    res.setHeader('X-RateLimit-Limit', rateLimitResult.limit);
+    res.setHeader('X-RateLimit-Remaining', rateLimitResult.remaining);
+    res.setHeader('X-RateLimit-Reset', rateLimitResult.reset);
+
+    if (!rateLimitResult.allowed) {
+      res.setHeader('Retry-After', rateLimitResult.retryAfter);
+      res.status(429).json({
+        error: 'Too many login attempts, please try again later',
+        retryAfter: rateLimitResult.retryAfter
+      });
+      return;
+    }
+
+    const parsedIdentity = serviceVerifiedIdentitySchema.safeParse(verified);
+    const sub = parsedIdentity.success ? parsedIdentity.data.sub.trim() : '';
+    const sid = parsedIdentity.success ? parsedIdentity.data.sid.trim() : '';
+    if (!sub || !sid) {
+      await recordFailedAttempt(req);
+      clearSessionCookie(req, res);
+      res.status(401).json({ error: 'Invalid credentials' });
+      return;
+    }
+
+    await issueVerifiedAlcoreSession(req, res, { sub, sid });
   };
 
   const respondPasskeyError = (res, error) => {
@@ -1087,6 +1134,7 @@ export const createUiAuth = ({
     resolveAuthContext,
     handleSessionStatus,
     handleSessionCreate,
+    handleServiceVerifiedSessionCreate,
     handleUrlAuthToken,
     handlePasskeyStatus,
     handlePasskeyRegistrationOptions,
