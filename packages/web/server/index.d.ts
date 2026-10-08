@@ -31,7 +31,8 @@ export interface StartWebUiServerOptions {
   host?: string;
   attachSignals?: boolean;
   exitOnShutdown?: boolean;
-  uiPassword?: string | null;
+  alcoreSecret?: string | null;
+  alcoreIssuer?: string | null;
   desktopUpdater?: DesktopUpdater;
   /** App-owned built-in resources outside Electron's ASAR archive. */
   builtInExtensionsDir?: string;
@@ -47,7 +48,8 @@ export declare function restartOpenCode(): Promise<void>;
 export declare function parseArgs(argv?: string[]): {
   port: number;
   host?: string;
-  uiPassword: string | null;
+  alcoreSecret: string | null;
+  alcoreIssuer?: string;
   tryCfTunnel: boolean;
   tunnelProvider?: string;
   tunnelMode?: string;

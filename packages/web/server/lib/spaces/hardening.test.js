@@ -78,8 +78,8 @@ describe('findHardeningViolations', () => {
   it.each([
     ['user', { ...goodContainer(), Config: { User: '' } }],
     ['user', { ...goodContainer(), Config: { User: '0:0' } }],
-    ['environment', withEnv(['OPENCHAMBER_UI_PASSWORD=secret'])],
-    ['environment', withEnv(['OPENCHAMBER_UI_PASSWORD='])],
+    ['environment', withEnv(['ALCORE_JWT_SECRET=secret'])],
+    ['environment', withEnv(['ALCORE_JWT_SECRET='])],
     // OpenCode 2 takes a provider key from its environment, directly or inside its config text.
     ['environment', withEnv(['OPENAI_API_KEY=x'])],
     ['environment', withEnv(['OPENCODE_CONFIG_CONTENT={"provider":{"groq":{"options":{"apiKey":"x"}}}}'])],
@@ -308,7 +308,7 @@ describe('findGatekeeperHardeningViolations', () => {
   });
 
   it.each([
-    ['gatekeeper_environment', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, Env: ['HOME=/tmp', 'OPENCHAMBER_UI_PASSWORD=secret'] } }],
+    ['gatekeeper_environment', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, Env: ['HOME=/tmp', 'ALCORE_JWT_SECRET=secret'] } }],
     ['gatekeeper_environment', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, Env: ['HOME=/tmp', 'OPENAI_API_KEY=x'] } }],
     ['gatekeeper_user', { ...goodGatekeeper(), Config: { ...goodGatekeeper().Config, User: '0:0' } }],
     ['gatekeeper_read_only', withGatekeeperHost({ ReadonlyRootfs: false })],

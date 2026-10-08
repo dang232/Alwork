@@ -156,7 +156,7 @@ const until = async (check, timeoutMs = 3_000) => {
 /** One space's server: the sessions it lists, in pages of two, an event stream, and an echo socket. */
 const startSpaceServer = async ({ sessions, status = {} }) => {
   const { createUiAuth } = await import('../ui-auth/ui-auth.js');
-  const auth = createUiAuth({ password: TOKEN, readSettingsFromDiskMigrated: async () => ({}) });
+  const auth = createUiAuth({ alcoreSecret: TOKEN, readSettingsFromDiskMigrated: async () => ({}) });
   const state = { eventStreams: [], sessions, listRequests: 0 };
   const app = express();
   app.post('/auth/session', express.json(), auth.handleSessionCreate);

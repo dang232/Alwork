@@ -1,10 +1,23 @@
 import { afterEach, describe, expect, it } from 'bun:test';
+import crypto from 'node:crypto';
 import express from 'express';
 import http from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 
 import { attachRealtimeProxy, buildRealtimeProxySseUrl, buildRealtimeProxyWsUrl } from './realtime-proxy.js';
 import { createUiAuth } from './ui-auth/ui-auth.js';
+
+const ALCORE_TEST_SECRET = 'realtime-proxy-test-secret-0123456789abcdef';
+const ALCORE_TEST_ISSUER = 'https://auth.alcore.test';
+
+const mintAlcoreToken = () => {
+  const b64url = (value) => Buffer.from(value, 'utf8').toString('base64url');
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { sub: 'user-1', sid: 'sess-1', iss: ALCORE_TEST_ISSUER, aud: 'auth', intent: 'session', exp: now + 900 };
+  const data = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+  return `${data}.${crypto.createHmac('sha256', ALCORE_TEST_SECRET).update(data).digest().toString('base64url')}`;
+};
 
 const servers = [];
 
@@ -257,20 +270,20 @@ describe('realtime proxy', () => {
     }
   });
 
-  it('allows first passwordless WebSocket proxy upgrade without an existing cookie', async () => {
+  it('allows an Alcore-authenticated WebSocket proxy upgrade without an existing cookie', async () => {
     const upstreamServer = http.createServer();
     const upstreamWs = new WebSocketServer({ server: upstreamServer });
     upstreamWs.on('connection', (socket) => {
       socket.send('ready');
     });
     const upstreamOrigin = await listen(upstreamServer);
-    const uiAuthController = createUiAuth({ password: '' });
+    const uiAuthController = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
     const { origin, runtime } = await startProxyServerWithAuthController({ apiBaseUrl: upstreamOrigin, uiAuthController });
 
     try {
       const target = `${upstreamOrigin.replace(/^http:/, 'ws:')}/api/global/event/ws`;
       const client = new WebSocket(buildRealtimeProxyWsUrl(origin, target), {
-        headers: { Origin: 'openchamber-ui://app' },
+        headers: { Origin: 'openchamber-ui://app', Authorization: `Bearer ${mintAlcoreToken()}` },
       });
       const message = await new Promise((resolve, reject) => {
         client.once('message', (data) => resolve(data.toString()));

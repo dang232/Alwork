@@ -354,9 +354,9 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
             restartCmdFallback += ` --host '${escapedHost}'`;
           }
         }
-        // The UI password reaches the restarted server through the update
-        // child's environment (OPENCHAMBER_UI_PASSWORD), never as a flag: the
-        // command line shows in the process list and is written to the log.
+        // Alcore login reaches the restarted server through its environment
+        // (ALCORE_JWT_SECRET), inherited here: the secret never appears as a
+        // flag since the command line shows in the process list and logs.
         if (storedOptions.apiOnly === true) {
           restartCmdPrimary += ' --api-only';
           restartCmdFallback += ' --api-only';
@@ -454,9 +454,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
         const child = spawnChild(shell, [shellFlag, script], {
           detached: true,
           stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore',
-          env: storedOptions.uiPassword
-            ? { ...process.env, OPENCHAMBER_UI_PASSWORD: storedOptions.uiPassword }
-            : process.env,
+          env: process.env,
           windowsHide: true,
         });
         child.unref();

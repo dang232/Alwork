@@ -36,9 +36,9 @@ const listen = (app) => new Promise((resolve) => {
 const close = (server) => new Promise((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); });
 
 /** The stand-in for the server inside: the host's own UI auth in front of a few routes that tell what they saw. */
-const startInside = async ({ password = TOKEN } = {}) => {
+const startInside = async ({ secret = TOKEN } = {}) => {
   const { createUiAuth } = await import('../ui-auth/ui-auth.js');
-  const auth = createUiAuth({ password, readSettingsFromDiskMigrated: async () => ({}) });
+  const auth = createUiAuth({ alcoreSecret: secret, readSettingsFromDiskMigrated: async () => ({}) });
   const seen = [];
   const state = { logins: 0, refuseNext: 0, sseClosed: 0, sseRequests: [] };
   const app = express();
@@ -517,7 +517,7 @@ describe('space dispatcher', () => {
     // server restarted on it; the host still remembers the old one and has no session left.
     const previous = inside;
     const rotated = 'tok_' + 'c'.repeat(40);
-    inside = await startInside({ password: rotated });
+    inside = await startInside({ secret: rotated });
     await previous.stop();
     transport.readToken = async () => { transport.calls.readToken += 1; return rotated; };
     // The pooled connections to the old server are gone; the remembered token is not.

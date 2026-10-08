@@ -31,7 +31,7 @@ const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 /** The stand-in inside: the host's UI auth, the terminal's upgrade rule, an echo socket that reports what it saw. */
 const startInside = async () => {
   const { createUiAuth } = await import('../ui-auth/ui-auth.js');
-  const auth = createUiAuth({ password: TOKEN, readSettingsFromDiskMigrated: async () => ({}) });
+  const auth = createUiAuth({ alcoreSecret: TOKEN, readSettingsFromDiskMigrated: async () => ({}) });
   const state = { logins: 0, refuseNext: 0, upgrades: [], sockets: new Set() };
   const app = express();
   app.post('/auth/session', express.json(), (req, res) => { state.logins += 1; return auth.handleSessionCreate(req, res); });

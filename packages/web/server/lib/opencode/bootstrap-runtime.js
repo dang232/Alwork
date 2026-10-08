@@ -24,7 +24,9 @@ export const createBootstrapRuntime = (dependencies) => {
       getServerPort,
       getTunnelUrl,
       verboseRequestLogs,
-      uiPassword,
+      alcoreSecret,
+      alcorePreviousSecret,
+      alcoreIssuer,
       tunnelAuthController,
       remoteClientAuthRuntime,
       clientPairingRuntime,
@@ -71,12 +73,14 @@ export const createBootstrapRuntime = (dependencies) => {
     } = options;
 
     const uiAuthController = createUiAuth({
-      password: uiPassword,
+      alcoreSecret,
+      alcorePreviousSecret,
+      alcoreIssuer,
       readSettingsFromDiskMigrated,
       clientAuthController: remoteClientAuthRuntime,
     });
     if (uiAuthController.enabled) {
-      console.log('UI password protection enabled for browser sessions');
+      console.log('Alcore login required for browser sessions');
     }
 
     registerServerStatusRoutes(app, {

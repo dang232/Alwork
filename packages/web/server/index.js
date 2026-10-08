@@ -13,6 +13,7 @@ import os from 'os';
 import crypto from 'crypto';
 import http2 from 'node:http2';
 import { createUiAuth } from './lib/ui-auth/ui-auth.js';
+import { z } from 'zod';
 import { createTunnelAuth } from './lib/opencode/tunnel-auth.js';
 import { createManagedTunnelConfigRuntime } from './lib/tunnels/managed-config.js';
 import { createTunnelProviderRegistry } from './lib/tunnels/registry.js';
@@ -1988,12 +1989,14 @@ async function main(options = {}) {
     }
     return urls;
   };
-  const uiPassword = typeof options.uiPassword === 'string'
-    ? options.uiPassword
-    : (typeof process.env.OPENCHAMBER_UI_PASSWORD === 'string' ? process.env.OPENCHAMBER_UI_PASSWORD : null);
+  const alcoreSecret = z.string().min(1).optional().safeParse(options.alcoreSecret).data
+    ?? z.string().min(1).optional().safeParse(process.env.ALCORE_JWT_SECRET).data
+    ?? z.string().min(1).optional().safeParse(process.env.JWT_SECRET).data
+    ?? null;
+  const alcoreIssuer = z.string().min(1).optional().safeParse(options.alcoreIssuer).data?.trim() || undefined;
   if (
     isNetworkExposedBindHost(effectiveBindHost)
-    && !(typeof uiPassword === 'string' && uiPassword.trim().length > 0)
+    && alcoreSecret === null
     && !isUnsafeUnauthenticatedLanAllowed(process.env)
   ) {
     throw new Error(getUnauthenticatedLanErrorMessage(effectiveBindHost));
@@ -2231,7 +2234,8 @@ async function main(options = {}) {
     },
     getTunnelUrl: () => tunnelRuntimeContextHolder?.tunnelService?.getPublicUrl?.() ?? null,
     verboseRequestLogs: OPENCHAMBER_VERBOSE_REQUEST_LOGS,
-    uiPassword,
+    alcoreSecret,
+    alcoreIssuer,
     tunnelAuthController,
     remoteClientAuthRuntime,
     clientPairingRuntime,
@@ -2335,7 +2339,7 @@ async function main(options = {}) {
     isRequestOriginAllowed,
   });
 
-  const tunnelRuntimeContext = tunnelWiringRuntime.initialize(app, port, Boolean(uiPassword?.trim()));
+  const tunnelRuntimeContext = tunnelWiringRuntime.initialize(app, port, true);
   const { tunnelService, startTunnelWithNormalizedRequest } = tunnelRuntimeContext;
   tunnelRuntimeContextHolder = tunnelRuntimeContext;
 

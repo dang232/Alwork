@@ -155,12 +155,12 @@ export const SPACE_ENVIRONMENT = Object.freeze({
   OPENCHAMBER_SPACE_IDLE_STOP_FILE: SPACE_IDLE_STOP_PATH,
 });
 
-// Waits for the token file, takes it as the server password, and becomes the server.
-// The password reaches the server through the environment of this one process, never through the container's.
+// Waits for the token file, takes it as the space's Alcore secret, and becomes the server.
+// The secret reaches the server through the environment of this one process, never through the container's.
 const SERVER_SCRIPT = [
   `while [ ! -s ${SPACE_TOKEN_PATH} ]; do ${IMAGE_SLEEP} 0.2; done;`,
-  `OPENCHAMBER_UI_PASSWORD="$(${IMAGE_CAT} ${SPACE_TOKEN_PATH})";`,
-  'export OPENCHAMBER_UI_PASSWORD;',
+  `ALCORE_JWT_SECRET="$(${IMAGE_CAT} ${SPACE_TOKEN_PATH})";`,
+  'export ALCORE_JWT_SECRET;',
   `exec openchamber serve --foreground --api-only --host ${SPACE_SERVER_HOST} --port ${SPACE_SERVER_PORT}`,
 ].join(' ');
 

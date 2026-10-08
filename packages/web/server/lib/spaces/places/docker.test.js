@@ -237,9 +237,9 @@ describe('docker place: create', () => {
       '--env', 'OPENCHAMBER_SPACE_IDLE_STOP_FILE=/home/space/.openchamber-space/idle-stop.json',
       SPACE_BASE_IMAGE,
       '/bin/sh', '-c',
-      'while [ ! -s /home/space/.openchamber-space/token ]; do /bin/sleep 0.2; done; OPENCHAMBER_UI_PASSWORD="$(/bin/cat /home/space/.openchamber-space/token)"; export OPENCHAMBER_UI_PASSWORD; exec openchamber serve --foreground --api-only --host 127.0.0.1 --port 27600',
+      'while [ ! -s /home/space/.openchamber-space/token ]; do /bin/sleep 0.2; done; ALCORE_JWT_SECRET="$(/bin/cat /home/space/.openchamber-space/token)"; export ALCORE_JWT_SECRET; exec openchamber serve --foreground --api-only --host 127.0.0.1 --port 27600',
     ]);
-    expect(Object.keys(SPACE_ENVIRONMENT)).not.toContain('OPENCHAMBER_UI_PASSWORD');
+    expect(Object.keys(SPACE_ENVIRONMENT)).not.toContain('ALCORE_JWT_SECRET');
     expect(SPACE_SERVER_COMMAND.join(' ')).not.toMatch(/\n/);
   });
 

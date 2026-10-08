@@ -460,7 +460,7 @@ describe('OpenChamber web update route on Windows', () => {
       platform: 'win32',
       execPath: 'C:\\Program Files\\nodejs\\node.exe',
       environment: { ComSpec: 'C:\\Windows\\system32\\cmd.exe' },
-      storedOptions: { launchMode: 'daemon', port: 7897, uiPassword: 'pa%ss' },
+      storedOptions: { launchMode: 'daemon', port: 7897 },
     });
     childProcess.spawn.mockReturnValue({ unref: vi.fn() });
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -477,7 +477,7 @@ describe('OpenChamber web update route on Windows', () => {
     expect(lines.filter((line) => line.startsWith('currentVersion=') || line.startsWith('restartCommand='))).toEqual([]);
     expect(lines).toContain('echo packageManager=npm');
     expect(lines).toContain('echo restartCommand=^("C:\\Program Files\\nodejs\\node.exe" "/opt/openchamber/bin/cli.js" serve --port 7897^) ^|^| ^(openchamber serve --port 7897^)');
-    // The UI password is never part of the script or its log.
+    // No secret is ever part of the script or its log.
     expect(script).not.toContain('pa%');
     // A .cmd shim (npm, pnpm, yarn) must be `call`ed or the script ends there.
     expect(lines).toContain('call npm install -g @openchamber/web@latest');
@@ -487,14 +487,15 @@ describe('OpenChamber web update route on Windows', () => {
     expect(lines.at(-2)).toBe('del "%~f0"');
     expect(lines).toContain('  ("C:\\Program Files\\nodejs\\node.exe" "/opt/openchamber/bin/cli.js" serve --port 7897) || (openchamber serve --port 7897)');
 
-    // The restarted server reads the password from its environment.
+    // The restarted server inherits its environment (Alcore secret included);
+    // no credential is added for the update child.
     expect(childProcess.spawn).toHaveBeenCalledWith(
       'C:\\Windows\\system32\\cmd.exe',
       ['/c', scriptPath],
       expect.objectContaining({
         detached: true,
         windowsHide: true,
-        env: expect.objectContaining({ OPENCHAMBER_UI_PASSWORD: 'pa%ss' }),
+        env: process.env,
       }),
     );
     // The listener is closed before the batch is spawned, so the detached

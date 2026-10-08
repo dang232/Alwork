@@ -28,11 +28,22 @@ const listen = async (server) => {
   return `http://127.0.0.1:${server.address().port}`;
 };
 
-const login = async (origin, password) => {
+const ALCORE_TEST_ISSUER = 'https://auth.alcore.test';
+
+const mintAlcoreToken = (secret, { sub = 'user-1', sid = 'sess-1' } = {}) => {
+  const b64url = (value) => Buffer.from(value, 'utf8').toString('base64url');
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { sub, sid, iss: ALCORE_TEST_ISSUER, aud: 'auth', intent: 'session', exp: now + 900 };
+  const data = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+  return `${data}.${crypto.createHmac('sha256', secret).update(data).digest().toString('base64url')}`;
+};
+
+const login = async (origin, alcoreToken) => {
   const response = await fetch(`${origin}/auth/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password }),
+    body: JSON.stringify({ alcoreToken }),
   });
   expect(response.status).toBe(200);
   const cookie = response.headers.get('set-cookie').split(';')[0];
@@ -73,9 +84,9 @@ const connect = (url, origin = 'openchamber-ui://app') => new Promise((resolve, 
 });
 
 it('connects through the desktop proxy to an authenticated terminal without weakening either gate', async () => {
-  const password = crypto.randomBytes(24).toString('hex');
-  const remoteAuth = createUiAuth({ password });
-  const localAuth = createUiAuth({ password });
+  const alcoreSecret = crypto.randomBytes(24).toString('hex');
+  const remoteAuth = createUiAuth({ alcoreSecret, alcoreIssuer: ALCORE_TEST_ISSUER });
+  const localAuth = createUiAuth({ alcoreSecret, alcoreIssuer: ALCORE_TEST_ISSUER });
   const remoteApp = express();
   const localApp = express();
   for (const [app, auth] of [[remoteApp, remoteAuth], [localApp, localAuth]]) {
@@ -116,8 +127,8 @@ it('connects through the desktop proxy to an authenticated terminal without weak
       getUiAuthController: () => localAuth,
       isRequestOriginAllowed: security.isRequestOriginAllowed,
     });
-    const remoteToken = await login(remoteOrigin, password);
-    const localToken = await login(localOrigin, password);
+    const remoteToken = await login(remoteOrigin, mintAlcoreToken(alcoreSecret));
+    const localToken = await login(localOrigin, mintAlcoreToken(alcoreSecret));
     const target = new URL('/api/terminal/ws', remoteOrigin);
     target.protocol = 'ws:';
     target.searchParams.set('oc_url_token', remoteToken);

@@ -11,6 +11,7 @@ import path from 'path';
 import os from 'os';
 import { createUiPasskeys } from './ui-passkeys.js';
 import { sessionCookieNameForRequest } from './session-cookie.js';
+import { z } from 'zod';
 
 const SESSION_COOKIE_NAME = 'oc_ui_session';
 const HOUR_MS = 60 * 60 * 1000;
@@ -396,11 +397,163 @@ const buildCookie = ({
   return attributes.join('; ');
 };
 
-const normalizePassword = (candidate) => {
-  if (typeof candidate !== 'string') {
-    return '';
+// Alcore login (Wave 1): replaces the --ui-password gate. Browser access
+// requires a valid Alcore access token (HS256 JWT minted by the Alcore auth
+// service: { sub, sid, iss, aud: 'auth', intent: 'session', exp }), exchanged
+// via POST /auth/session for a port-scoped UI session cookie, or presented
+// directly as Authorization: Bearer. Verified with node:crypto only — no new
+// dependencies. Pairing/client tokens (oc_client_...) and the 127.0.0.1
+// default bind are untouched; only this gate changes.
+const DEFAULT_ALCORE_ISSUER = 'https://auth.alcore.io.vn';
+const ALCORE_AUD = 'auth';
+const ALCORE_INTENT = 'session';
+
+export const readAlcoreIssuer = (explicit) => {
+  const direct = z.string().min(1).optional().safeParse(explicit).data?.trim();
+  if (direct) return direct;
+  const fromEnv = z.string().min(1).optional().safeParse(
+    process.env.ALCORE_ISSUER ?? process.env.AUTH_ISSUER,
+  ).data?.trim();
+  return fromEnv || DEFAULT_ALCORE_ISSUER;
+};
+
+const alcoreKeyOptionsSchema = z.object({
+  current: z.string().optional(),
+  alcoreSecret: z.string().optional(),
+  previous: z.string().optional(),
+  alcorePreviousSecret: z.string().optional(),
+  currentKid: z.string().optional(),
+  alcoreKid: z.string().optional(),
+  previousKid: z.string().optional(),
+  alcorePreviousKid: z.string().optional(),
+});
+
+const firstSecret = (values) => {
+  for (const value of values) {
+    if (value !== undefined && value !== '') return value;
   }
-  return candidate.normalize().trim();
+  return '';
+};
+
+const firstKid = (values, fallback) => {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed) return trimmed;
+  }
+  return fallback;
+};
+
+export const readAlcoreKeys = (explicit = {}) => {
+  const options = alcoreKeyOptionsSchema.safeParse(explicit).data ?? {};
+  const env = process.env;
+  const current = firstSecret([options.current, options.alcoreSecret, env.ALCORE_JWT_SECRET, env.JWT_SECRET]);
+  const previous = firstSecret([options.previous, options.alcorePreviousSecret, env.ALCORE_JWT_SECRET_PREVIOUS, env.JWT_SECRET_PREVIOUS]);
+  const currentKid = firstKid([options.currentKid, options.alcoreKid, env.ALCORE_JWT_SECRET_KID, env.JWT_SECRET_KID], 'k1');
+  const previousKid = firstKid([options.previousKid, options.alcorePreviousKid, env.ALCORE_JWT_SECRET_PREVIOUS_KID, env.JWT_SECRET_PREVIOUS_KID], 'k0');
+  return previous === '' ? { current, currentKid } : { current, currentKid, previous, previousKid };
+};
+
+const alcoreB64Decode = (input) => Buffer.from(String(input).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+const alcoreB64DecodeBytes = (input) => Buffer.from(String(input).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+const alcoreSignData = (data, secret) => crypto.createHmac('sha256', Buffer.from(secret, 'utf8')).update(Buffer.from(data, 'utf8')).digest();
+
+const alcoreHeaderSchema = z.object({
+  alg: z.string(),
+  kid: z.string().optional(),
+});
+
+const alcorePayloadSchema = z.object({
+  sub: z.string().min(1),
+  sid: z.string().min(1),
+  iss: z.string(),
+  aud: z.string(),
+  exp: z.number(),
+  intent: z.string(),
+});
+
+const alcoreKeySetSchema = z.object({
+  current: z.string().optional(),
+  currentKid: z.string().optional(),
+  previous: z.string().optional(),
+  previousKid: z.string().optional(),
+});
+
+export const verifyAlcoreAccessToken = (token, keys, issuer) => {
+  const clean = z.string().min(1).safeParse(token).data;
+  if (!clean) throw new Error('malformed jwt');
+  const parts = clean.split('.');
+  if (parts.length !== 3) throw new Error('malformed jwt');
+  const headerEnc = parts[0] ?? '';
+  const payloadEnc = parts[1] ?? '';
+  const sig = parts[2] ?? '';
+  let headerRaw;
+  let payloadRaw;
+  try {
+    headerRaw = JSON.parse(alcoreB64Decode(headerEnc));
+    payloadRaw = JSON.parse(alcoreB64Decode(payloadEnc));
+  } catch {
+    throw new Error('malformed jwt');
+  }
+  const header = alcoreHeaderSchema.safeParse(headerRaw).data;
+  if (!header) throw new Error('malformed jwt');
+  if (header.alg !== 'HS256') throw new Error('unsupported alg');
+  const rawKid = header.kid ?? null;
+  const tokenKid = rawKid === null || rawKid === '' ? null : rawKid;
+  const keySet = alcoreKeySetSchema.safeParse(keys).data ?? {};
+  if (tokenKid !== null) {
+    const known = (keySet.currentKid !== undefined && tokenKid === keySet.currentKid)
+      || (keySet.previousKid !== undefined && tokenKid === keySet.previousKid);
+    if (!known) throw new Error('unknown kid');
+  }
+  const current = keySet.current ?? '';
+  const previous = keySet.previous ?? '';
+  const candidates = tokenKid === null
+    ? (previous !== '' ? [current, previous] : [current])
+    : (tokenKid === keySet.previousKid && previous !== '' ? [previous] : [current]);
+  const data = headerEnc + '.' + payloadEnc;
+  const presented = alcoreB64DecodeBytes(sig);
+  let ok = false;
+  for (const candidate of candidates) {
+    if (candidate === '') continue;
+    const expected = alcoreSignData(data, candidate);
+    if (presented.length === expected.length && crypto.timingSafeEqual(presented, expected)) {
+      ok = true;
+      break;
+    }
+  }
+  if (!ok) throw new Error('bad signature');
+  const claims = alcorePayloadSchema.safeParse(payloadRaw).data;
+  if (!claims) throw new Error('malformed payload');
+  if (claims.iss !== issuer || claims.aud !== ALCORE_AUD) throw new Error('malformed payload');
+  if (claims.intent !== ALCORE_INTENT) throw new Error('malformed payload');
+  if (claims.exp <= Math.floor(Date.now() / 1000)) throw new Error('expired');
+  return { sub: claims.sub, sid: claims.sid, iss: claims.iss, aud: claims.aud, exp: claims.exp, intent: claims.intent };
+};
+
+const getAlcoreTokenFromRequest = (req) => {
+  const header = req?.headers?.authorization;
+  const first = (Array.isArray(header) ? header[0] : header) ?? '';
+  const text = z.string().safeParse(first).data ?? '';
+  const match = text.match(/^Bearer\s+(.+)$/i);
+  const token = match?.[1]?.trim() ?? '';
+  if (token !== '' && token.split('.').length === 3 && !token.startsWith('oc_client_')) return token;
+  return null;
+};
+
+const alcoreLoginBodySchema = z.object({
+  alcoreToken: z.string().optional(),
+  accessToken: z.string().optional(),
+  token: z.string().optional(),
+});
+
+const readAlcoreLoginToken = (req) => {
+  const body = alcoreLoginBodySchema.safeParse(req?.body).data;
+  const candidates = [body?.alcoreToken, body?.accessToken, body?.token];
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (trimmed && trimmed.split('.').length === 3) return trimmed;
+  }
+  return getAlcoreTokenFromRequest(req);
 };
 
 const isTrustedDeviceRequest = (value) => value === true;
@@ -450,6 +603,11 @@ function persistJwtSecret(secret) {
 
 export const createUiAuth = ({
   password,
+  alcoreSecret,
+  alcorePreviousSecret,
+  alcoreIssuer,
+  alcoreKid,
+  alcorePreviousKid,
   cookieName = SESSION_COOKIE_NAME,
   sessionTtlMs = SESSION_TTL_MS,
   trustedSessionTtlMs = TRUSTED_DEVICE_SESSION_TTL_MS,
@@ -457,7 +615,21 @@ export const createUiAuth = ({
   clientAuthController = null,
   requireClientAuth = false,
 } = {}) => {
-  const normalizedPassword = normalizePassword(password);
+  const alcoreIssuerValue = readAlcoreIssuer(alcoreIssuer);
+  const alcoreKeys = () => readAlcoreKeys({ alcoreSecret, alcorePreviousSecret, alcoreKid, alcorePreviousKid });
+  const verifyAlcore = (token) => {
+    const keys = alcoreKeys();
+    if (!keys.current) throw new Error('alcore not configured');
+    return verifyAlcoreAccessToken(token, keys, alcoreIssuerValue);
+  };
+  const tryVerifyAlcore = (token) => {
+    if (!token) return null;
+    try {
+      return verifyAlcore(token);
+    } catch {
+      return null;
+    }
+  };
   const urlAuthTokens = new Map();
 
   const sweepUrlAuthTokens = () => {
@@ -531,145 +703,8 @@ export const createUiAuth = ({
     client: clientAuth?.client || null,
   });
 
-  if (!normalizedPassword) {
-    const setSessionCookie = (req, res, token, ttlMs = sessionTtlMs) => {
-      const secure = isSecureRequest(req);
-      const maxAgeSeconds = Math.floor(ttlMs / 1000);
-      const header = buildCookie({
-        name: sessionCookieNameForRequest(req, cookieName),
-        value: encodeURIComponent(token),
-        maxAge: maxAgeSeconds,
-        secure,
-      });
-      res.setHeader('Set-Cookie', header);
-    };
-
-    const ensureSessionToken = async (req, res) => {
-      const cookies = parseCookies(req.headers.cookie);
-      const name = sessionCookieNameForRequest(req, cookieName);
-      if (cookies[name]) {
-        return cookies[name];
-      }
-      const token = crypto.randomBytes(32).toString('base64url');
-      setSessionCookie(req, res, token, sessionTtlMs);
-      return token;
-    };
-
-    const requireAuth = async (req, res, next) => {
-      if (!requireClientAuth) {
-        return next();
-      }
-      if (req.method === 'OPTIONS') {
-        return next();
-      }
-      const clientAuth = await authenticateClientRequest(req);
-      if (clientAuth) {
-        return next();
-      }
-      return res.status(401).json({ error: 'Client authentication required', locked: true, clientAuthRequired: true });
-    };
-
-    const requireSessionAuth = async (req, res, next) => {
-      if (!requireClientAuth) {
-        return next();
-      }
-      if (req.method === 'OPTIONS') {
-        return next();
-      }
-      return res.status(401).json({ error: 'UI session authentication required', locked: true });
-    };
-
-    const resolveAuthContext = async (req, res, { allowClientAuth = true, allowUrlToken = true } = {}) => {
-      const cookies = parseCookies(req.headers.cookie);
-      const name = sessionCookieNameForRequest(req, cookieName);
-      if (cookies[name]) {
-        return { type: 'session', token: cookies[name] };
-      }
-      if (allowClientAuth) {
-        const clientAuth = await authenticateClientRequest(req, { allowUrlToken });
-        if (clientAuth) return clientAuthContext(clientAuth);
-      }
-      if (!requireClientAuth) {
-        const token = await ensureSessionToken(req, res);
-        return { type: 'session', token };
-      }
-      return null;
-    };
-
-    return {
-      enabled: false,
-      requireAuth,
-      requireSessionAuth,
-      resolveAuthContext,
-      handleSessionStatus: async (req, res) => {
-        if (requireClientAuth) {
-          const clientAuth = await authenticateClientRequest(req);
-          if (clientAuth) {
-            return res.json({ authenticated: true, disabled: true, scope: 'client' });
-          }
-          return res.status(401).json({ authenticated: false, locked: true, clientAuthRequired: true });
-        }
-        res.json({ authenticated: true, disabled: true });
-      },
-      handleSessionCreate: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      handleUrlAuthToken: async (req, res) => {
-        const scope = readRequestedUrlAuthScope(req);
-        if (scope === undefined) {
-          return res.status(400).json({ error: 'Unknown URL token scope' });
-        }
-        const clientAuth = await authenticateClientRequest(req, { allowUrlToken: false });
-        if (clientAuth) {
-          res.setHeader('Cache-Control', 'no-store');
-          return res.json(issueUrlAuthTokenForSession(clientSessionToken(clientAuth), scope));
-        }
-        if (requireClientAuth) {
-          return res.status(401).json({ error: 'Client authentication required', locked: true, clientAuthRequired: true });
-        }
-        const sessionToken = await ensureSessionToken(req, res);
-        res.setHeader('Cache-Control', 'no-store');
-        return res.json(issueUrlAuthTokenForSession(sessionToken, scope));
-      },
-      handlePasskeyStatus: (_req, res) => {
-        res.json({ enabled: false, hasPasskeys: false, passkeyCount: 0, rpID: null });
-      },
-      handlePasskeyRegistrationOptions: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      handlePasskeyRegistrationVerify: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      handlePasskeyAuthenticationOptions: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      handlePasskeyAuthenticationVerify: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      handlePasskeyList: (_req, res) => {
-        res.json({ passkeys: [] });
-      },
-      handlePasskeyRevoke: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      handleResetAuth: (_req, res) => {
-        res.status(400).json({ error: 'UI password not configured' });
-      },
-      ensureSessionToken: async (req, res) => {
-        const clientAuth = await authenticateClientRequest(req);
-        if (clientAuth) return clientSessionToken(clientAuth);
-        return ensureSessionToken(req, res);
-      },
-      dispose: () => {
-
-      },
-    };
-  }
-
-  const salt = crypto.randomBytes(16);
-  const expectedHash = crypto.scryptSync(normalizedPassword, salt, 64);
   let jwtSecret = getOrCreateJwtSecret();
-  let passwordBinding = crypto.createHmac('sha256', jwtSecret).update(normalizedPassword).digest('hex');
+  let passwordBinding = crypto.createHmac('sha256', jwtSecret).update(`alcore:${alcoreIssuerValue}`).digest('hex');
   const resolveSessionTtlMs = (trustDevice) => (trustDevice ? trustedSessionTtlMs : sessionTtlMs);
   let passkeyController = createUiPasskeys({
     passwordBinding,
@@ -678,7 +713,7 @@ export const createUiAuth = ({
 
   const rebuildPasskeyController = () => {
     passkeyController.dispose();
-    passwordBinding = crypto.createHmac('sha256', jwtSecret).update(normalizedPassword).digest('hex');
+    passwordBinding = crypto.createHmac('sha256', jwtSecret).update(`alcore:${alcoreIssuerValue}`).digest('hex');
     passkeyController = createUiPasskeys({
       passwordBinding,
       readSettingsFromDiskMigrated,
@@ -724,22 +759,6 @@ export const createUiAuth = ({
     res.setHeader('Set-Cookie', header);
   };
 
-  const verifyPassword = (candidate) => {
-    if (!candidate) {
-      return false;
-    }
-    const normalizedCandidate = normalizePassword(candidate);
-    if (!normalizedCandidate) {
-      return false;
-    }
-    try {
-      const candidateHash = crypto.scryptSync(normalizedCandidate, salt, 64);
-      return crypto.timingSafeEqual(candidateHash, expectedHash);
-    } catch {
-      return false;
-    }
-  };
-
   const isSessionValid = async (token) => {
     if (!token) {
       return false;
@@ -777,6 +796,15 @@ export const createUiAuth = ({
     }
   };
 
+  const alcoreSessionToken = (payload) => `alcore:${payload.sub}`;
+
+  const alcoreAuthContext = (payload) => ({
+    type: 'alcore',
+    token: alcoreSessionToken(payload),
+    sub: payload.sub,
+    sid: payload.sid,
+  });
+
   const requireAuth = async (req, res, next) => {
     if (req.method === 'OPTIONS') {
       return next();
@@ -785,9 +813,15 @@ export const createUiAuth = ({
     if (await isSessionValid(token)) {
       return next();
     }
+    if (tryVerifyAlcore(getAlcoreTokenFromRequest(req))) {
+      return next();
+    }
     const clientAuth = await authenticateClientRequest(req);
     if (clientAuth) {
       return next();
+    }
+    if (requireClientAuth) {
+      return res.status(401).json({ error: 'Client authentication required', locked: true, clientAuthRequired: true });
     }
     clearSessionCookie(req, res);
     return respondUnauthorized(req, res);
@@ -799,6 +833,9 @@ export const createUiAuth = ({
     }
     const token = getTokenFromRequest(req);
     if (await isSessionValid(token)) {
+      return next();
+    }
+    if (tryVerifyAlcore(getAlcoreTokenFromRequest(req))) {
       return next();
     }
     clearSessionCookie(req, res);
@@ -813,6 +850,11 @@ export const createUiAuth = ({
     const authorization = req.headers?.authorization;
     const hasBearer = typeof authorization === 'string' && authorization.toLowerCase().startsWith('bearer ');
     if (hasBearer) {
+      const alcore = tryVerifyAlcore(getAlcoreTokenFromRequest(req));
+      if (alcore) {
+        res.json({ authenticated: true, scope: 'alcore', sub: alcore.sub });
+        return;
+      }
       const clientAuth = await authenticateClientRequest(req, { allowUrlToken: false });
       if (clientAuth) {
         res.json({ authenticated: true, scope: 'client' });
@@ -831,6 +873,10 @@ export const createUiAuth = ({
       res.json({ authenticated: true, scope: 'client' });
       return;
     }
+    if (requireClientAuth) {
+      res.status(401).json({ authenticated: false, locked: true, clientAuthRequired: true });
+      return;
+    }
     clearSessionCookie(req, res);
     res.status(401).json({ authenticated: false, locked: true });
   };
@@ -840,6 +886,8 @@ export const createUiAuth = ({
     if (await isSessionValid(token)) {
       return token;
     }
+    const alcore = tryVerifyAlcore(getAlcoreTokenFromRequest(req));
+    if (alcore) return alcoreSessionToken(alcore);
     const clientAuth = await authenticateClientRequest(req, { allowUrlToken });
     return clientAuth ? clientSessionToken(clientAuth) : null;
   };
@@ -849,6 +897,8 @@ export const createUiAuth = ({
     if (await isSessionValid(token)) {
       return { type: 'session', token };
     }
+    const alcore = tryVerifyAlcore(getAlcoreTokenFromRequest(req));
+    if (alcore) return alcoreAuthContext(alcore);
     if (!allowClientAuth) return null;
     const clientAuth = await authenticateClientRequest(req, { allowUrlToken });
     return clientAuth ? clientAuthContext(clientAuth) : null;
@@ -884,8 +934,8 @@ export const createUiAuth = ({
       return;
     }
 
-    const candidate = typeof req.body?.password === 'string' ? req.body.password : '';
-    if (!verifyPassword(candidate)) {
+    const alcore = tryVerifyAlcore(readAlcoreLoginToken(req));
+    if (!alcore) {
       await recordFailedAttempt(req);
       clearSessionCookie(req, res);
       res.status(401).json({ error: 'Invalid credentials' });
@@ -904,7 +954,7 @@ export const createUiAuth = ({
         expiresAt: new Date(Date.now() + ttlMs).toISOString(),
         clientKind: req.body?.clientKind,
         dedupeKey: req.body?.dedupeKey,
-        authMethod: 'password',
+        authMethod: 'alcore',
         deviceName: req.body?.deviceName,
         devicePlatform: req.body?.devicePlatform,
         deviceModel: req.body?.deviceModel,
@@ -914,6 +964,7 @@ export const createUiAuth = ({
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       authenticated: true,
+      alcore: { sub: alcore.sub, sid: alcore.sid },
       ...(clientTokenResult?.token ? { clientToken: clientTokenResult.token, client: clientTokenResult.client } : {}),
     });
   };

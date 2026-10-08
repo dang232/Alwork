@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from 'bun:test';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -44,11 +45,25 @@ const createResponse = () => {
   };
 };
 
+const ALCORE_TEST_SECRET = 'alcore-wave1-test-secret-0123456789abcdef';
+const ALCORE_TEST_ISSUER = 'https://auth.alcore.test';
+
+const alcoreB64url = (value) => Buffer.from(value, 'utf8').toString('base64url');
+
+const mintAlcoreToken = ({ sub = 'user-1', sid = 'sess-1', secret = ALCORE_TEST_SECRET, issuer = ALCORE_TEST_ISSUER, ttlSeconds = 900, kid } = {}) => {
+  const header = kid ? { alg: 'HS256', typ: 'JWT', kid } : { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { sub, sid, iss: issuer, aud: 'auth', intent: 'session', exp: now + ttlSeconds };
+  const data = alcoreB64url(JSON.stringify(header)) + '.' + alcoreB64url(JSON.stringify(payload));
+  const sig = crypto.createHmac('sha256', secret).update(data).digest().toString('base64url');
+  return data + '.' + sig;
+};
+
 describe('ui auth client credential seam', () => {
-  it('accepts bearer client credentials when UI password auth is enabled', async () => {
+  it('accepts bearer client credentials when Alcore login is enabled', async () => {
     const createUiAuth = await loadCreateUiAuth();
     const auth = createUiAuth({
-      password: 'secret',
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
       clientAuthController: {
         authenticateBearerToken: async (token) => token === 'client-token' ? { ok: true, clientId: 'device-1' } : null,
       },
@@ -74,7 +89,7 @@ describe('ui auth client credential seam', () => {
   it('does not accept bearer client credentials for UI-session-only auth', async () => {
     const createUiAuth = await loadCreateUiAuth();
     const auth = createUiAuth({
-      password: 'secret',
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
       clientAuthController: {
         authenticateBearerToken: async (token) => token === 'client-token' ? { ok: true, clientId: 'device-1' } : null,
       },
@@ -89,7 +104,7 @@ describe('ui auth client credential seam', () => {
     expect(clientCalled).toBe(false);
     expect(clientRes.statusCode).toBe(401);
 
-    const loginReq = { method: 'POST', headers: {}, body: { password: 'secret' } };
+    const loginReq = { method: 'POST', headers: {}, body: { alcoreToken: mintAlcoreToken() } };
     const loginRes = createResponse();
     await auth.handleSessionCreate(loginReq, loginRes);
     const sessionCookie = String(loginRes.getHeader('set-cookie') || '').split(';', 1)[0];
@@ -104,7 +119,7 @@ describe('ui auth client credential seam', () => {
     expect(sessionCalled).toBe(true);
   });
 
-  it('can require bearer client credentials when UI password is disabled', async () => {
+  it('can require bearer client credentials when Alcore is unconfigured', async () => {
     const createUiAuth = await loadCreateUiAuth();
     const auth = createUiAuth({
       requireClientAuth: true,
@@ -132,7 +147,7 @@ describe('ui auth client credential seam', () => {
   it('reports authenticated client session status with bearer credentials', async () => {
     const createUiAuth = await loadCreateUiAuth();
     const auth = createUiAuth({
-      password: 'secret',
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
       clientAuthController: {
         authenticateBearerToken: async (token) => token === 'client-token' ? { ok: true, clientId: 'device-1' } : null,
       },
@@ -148,7 +163,7 @@ describe('ui auth client credential seam', () => {
   it('exchanges bearer credentials for short-lived URL auth tokens', async () => {
     const createUiAuth = await loadCreateUiAuth();
     const auth = createUiAuth({
-      password: 'secret',
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
       clientAuthController: {
         authenticateBearerToken: async (token) => token === 'client-token' ? { ok: true, clientId: 'device-1' } : null,
       },
@@ -360,7 +375,7 @@ describe('ui auth client credential seam', () => {
     const createUiAuth = await loadCreateUiAuth();
     let createClientInput = null;
     const auth = createUiAuth({
-      password: 'secret',
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
       sessionTtlMs: 123_000,
       clientAuthController: {
         createClient: async (input) => {
@@ -385,7 +400,7 @@ describe('ui auth client credential seam', () => {
       method: 'POST',
       headers: {},
       body: {
-        password: 'secret',
+        alcoreToken: mintAlcoreToken(),
         issueClientToken: true,
         clientLabel: 'OpenChamber Desktop',
       },
@@ -403,10 +418,10 @@ describe('ui auth client credential seam', () => {
 
   it('gives a trusted device the trusted session lifetime', async () => {
     const createUiAuth = await loadCreateUiAuth();
-    const auth = createUiAuth({ password: 'secret', sessionTtlMs: 60_000, trustedSessionTtlMs: 3_600_000 });
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER, sessionTtlMs: 60_000, trustedSessionTtlMs: 3_600_000 });
     const maxAgeFor = async (trustDevice) => {
       const res = createResponse();
-      await auth.handleSessionCreate({ method: 'POST', headers: {}, body: { password: 'secret', trustDevice } }, res);
+      await auth.handleSessionCreate({ method: 'POST', headers: {}, body: { alcoreToken: mintAlcoreToken(), trustDevice } }, res);
       return String(res.getHeader('set-cookie')).match(/Max-Age=(\d+)/i)?.[1];
     };
     expect(await maxAgeFor(false)).toBe('60');
@@ -428,7 +443,7 @@ describe('ui auth client credential seam', () => {
 // by the request port so each instance owns its own slot.
 describe('ui auth port-scoped session cookies (issue #2377)', () => {
   const loginHost = async (auth, host) => {
-    const req = { method: 'POST', headers: { host }, body: { password: 'secret' } };
+    const req = { method: 'POST', headers: { host }, body: { alcoreToken: mintAlcoreToken() } };
     const res = createResponse();
     await auth.handleSessionCreate(req, res);
     return String(res.getHeader('set-cookie') || '').split(';', 1)[0];
@@ -436,7 +451,7 @@ describe('ui auth port-scoped session cookies (issue #2377)', () => {
 
   it('names the issued cookie with the request port', async () => {
     const createUiAuth = await loadCreateUiAuth();
-    const auth = createUiAuth({ password: 'secret' });
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
 
     const issued = await loginHost(auth, '192.168.0.1:3000');
     expect(issued).toMatch(/^oc_ui_session_3000=/);
@@ -445,14 +460,14 @@ describe('ui auth port-scoped session cookies (issue #2377)', () => {
 
   it('keeps the bare cookie name when the host has no explicit port', async () => {
     const createUiAuth = await loadCreateUiAuth();
-    const auth = createUiAuth({ password: 'secret' });
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
 
     expect(await loginHost(auth, '192.168.0.1')).toMatch(/^oc_ui_session=/);
   });
 
   it('reads the slot for the request port and ignores another port cookie', async () => {
     const createUiAuth = await loadCreateUiAuth();
-    const auth = createUiAuth({ password: 'secret' });
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
 
     // Valid token issued against :3000.
     const portCookie = await loginHost(auth, '192.168.0.1:3000');
@@ -482,7 +497,7 @@ describe('ui auth port-scoped session cookies (issue #2377)', () => {
 describe('ui auth login rate limit', () => {
   it('keys failed logins on the connection, not on a client-chosen X-Forwarded-For', async () => {
     const createUiAuth = await loadCreateUiAuth();
-    const auth = createUiAuth({ password: 'secret' });
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
     const attempt = async (index) => {
       // A rotated header is a deliberate spoof: without a trusted proxy in
       // front, Express leaves req.ip at the socket address.
@@ -490,7 +505,7 @@ describe('ui auth login rate limit', () => {
         method: 'POST',
         ip: '198.51.100.7',
         headers: { host: '127.0.0.1:3000', 'x-forwarded-for': `203.0.113.${index}` },
-        body: { password: 'wrong' },
+        body: { alcoreToken: mintAlcoreToken({ secret: 'wrong-secret-00000000000000000000000000' }) },
       };
       const res = createResponse();
       await auth.handleSessionCreate(req, res);

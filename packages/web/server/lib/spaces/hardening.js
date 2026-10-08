@@ -47,9 +47,9 @@ const FILLER_TMPFS_OPTIONS = 'rw,exec,nosuid,size=1g';
 // The container environment is an allowlist. Anything in it is readable through `docker inspect`
 // and by every process inside, and OpenCode 2 turns some variables into a login: a provider key
 // under one of its catalog's names, or a key inside OPENCODE_CONFIG_CONTENT. So a container may
-// carry the variables we set and the base image's own, and nothing else. The server password is
-// named on its own as well, so its message stays specific.
-const FORBIDDEN_ENVIRONMENT = ['OPENCHAMBER_UI_PASSWORD'];
+// carry the variables we set and the base image's own, and nothing else. The spaces' server secrets are
+// named on their own as well, so their message stays specific.
+const FORBIDDEN_ENVIRONMENT = ['ALCORE_JWT_SECRET', 'JWT_SECRET'];
 // The variables the pinned base image sets itself. Docker copies them into every container made
 // from it. Read on 2026-09-24 with
 // `docker image inspect <SPACE_BASE_IMAGE> --format '{{json .Config.Env}}'`, which answered

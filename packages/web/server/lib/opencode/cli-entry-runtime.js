@@ -35,7 +35,8 @@ export const runCliEntryIfMain = (dependencies) => {
     tunnelHostname: cliOptions.tunnelHostname,
     attachSignals: true,
     exitOnShutdown: true,
-    uiPassword: cliOptions.uiPassword,
+    alcoreSecret: cliOptions.alcoreSecret,
+    alcoreIssuer: cliOptions.alcoreIssuer,
     apiOnly: cliOptions.apiOnly,
   }).catch((error) => {
     console.error('Failed to start server:', error);

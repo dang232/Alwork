@@ -6,10 +6,14 @@ export const parseServeCliOptions = ({
   managedLocalMode,
 }) => {
   const args = Array.isArray(argv) ? [...argv] : [];
-  const envPassword =
-    env.OPENCHAMBER_UI_PASSWORD ||
-    env.OPENCODE_UI_PASSWORD ||
+  const envAlcoreSecret =
+    env.ALCORE_JWT_SECRET ||
+    env.JWT_SECRET ||
     null;
+  const envAlcoreIssuer =
+    env.ALCORE_ISSUER ||
+    env.AUTH_ISSUER ||
+    undefined;
   const envCfTunnel = env.OPENCHAMBER_TRY_CF_TUNNEL === 'true';
   const envTunnelProvider = env.OPENCHAMBER_TUNNEL_PROVIDER || undefined;
   const envTunnelMode = env.OPENCHAMBER_TUNNEL_MODE || undefined;
@@ -24,7 +28,8 @@ export const parseServeCliOptions = ({
   const options = {
     port: defaultPort,
     host: undefined,
-    uiPassword: envPassword,
+    alcoreSecret: envAlcoreSecret,
+    alcoreIssuer: envAlcoreIssuer,
     tryCfTunnel: envCfTunnel,
     tunnelProvider: envTunnelProvider,
     tunnelMode: envTunnelMode,
@@ -67,13 +72,6 @@ export const parseServeCliOptions = ({
       const { value, nextIndex } = consumeValue(i, inlineValue);
       i = nextIndex;
       options.host = typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
-      continue;
-    }
-
-    if (optionName === 'ui-password') {
-      const { value, nextIndex } = consumeValue(i, inlineValue);
-      i = nextIndex;
-      options.uiPassword = typeof value === 'string' ? value : '';
       continue;
     }
 
