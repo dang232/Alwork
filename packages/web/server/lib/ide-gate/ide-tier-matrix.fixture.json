@@ -1,0 +1,1 @@
+{"tiers":[{"features":["basic-ide"],"ideAccess":"allow","tier":"free-tier","ttlMinutes":15},{"features":[],"ideAccess":"deny","tier":"pending-payment","ttlMinutes":15},{"features":["full-access"],"ideAccess":"allow","tier":"paid","ttlMinutes":15}]}
