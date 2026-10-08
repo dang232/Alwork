@@ -11,7 +11,6 @@ export const createTunnelRoutesRuntime = (dependencies) => {
     tunnelService,
     tunnelProviderRegistry,
     tunnelAuthController,
-    hasUiPassword,
     readSettingsFromDiskMigrated,
     readManagedRemoteTunnelConfigFromDisk,
     normalizeTunnelProvider,
@@ -84,9 +83,6 @@ export const createTunnelRoutesRuntime = (dependencies) => {
     // Every tunnel start passes here: the Settings button and `--tunnel` at startup.
     if (isEnterpriseMode()) {
       throw Object.assign(new Error(TUNNEL_BLOCKED_ERROR), { code: 'enterprise_mode' });
-    }
-    if (!hasUiPassword) {
-      throw new Error('A UI password is required before starting a public tunnel. Restart OpenChamber with --ui-password.');
     }
     if (provider === TUNNEL_PROVIDER_CLOUDFLARE && mode === TUNNEL_MODE_MANAGED_REMOTE) {
       setRuntimeManagedRemoteTunnelHostname(hostname);
@@ -462,9 +458,6 @@ export const createTunnelRoutesRuntime = (dependencies) => {
     app.post('/api/openchamber/tunnel/start', async (_req, res) => {
       if (isEnterpriseMode()) {
         return res.status(403).json({ ok: false, code: 'enterprise_mode', error: TUNNEL_BLOCKED_ERROR });
-      }
-      if (!hasUiPassword) {
-        return res.status(403).json({ ok: false, code: 'ui_password_required', error: 'A UI password is required before starting a public tunnel. Restart OpenChamber with --ui-password.' });
       }
       try {
         const settings = await readSettingsFromDiskMigrated();

@@ -17,19 +17,12 @@ async function statusCommand(options = {}) {
         discoverDesktopInstance(),
       ]);
 
-  const toPasswordProtectionLabel = (value) => {
-    if (value === true) return 'yes';
-    if (value === false) return 'no';
-    return 'unknown';
-  };
-
   const desktopOnly = desktopInstance && !runningInstances.some((entry) => entry.port === desktopInstance.port)
     ? {
         runtime: 'desktop',
         port: desktopInstance.port,
         pid: Number.isFinite(desktopInstance.pid) ? desktopInstance.pid : null,
         launchMode: null,
-        passwordProtected: null,
         bindHost: null,
       }
     : null;
@@ -38,15 +31,12 @@ async function statusCommand(options = {}) {
     .filter((instance) => instance.runtime !== 'desktop')
     .map((instance) => {
       const storedOptions = instance.instanceFilePath ? (readInstanceOptions(instance.instanceFilePath) || {}) : {};
-      const passwordProtected = storedOptions.hasUiPassword === true
-        || (typeof storedOptions.uiPassword === 'string' && storedOptions.uiPassword.trim().length > 0);
 
       return {
         runtime: instance.source === 'probe' ? 'unmanaged' : 'cli',
         port: instance.port,
         pid: instance.pid,
         launchMode: instance.launchMode || 'daemon',
-        passwordProtected: instance.source === 'probe' ? null : passwordProtected,
         // The address the server was asked to bind, not the one a probe
         // answered on: a server bound to 0.0.0.0 also answers on loopback.
         bindHost: storedOptions.host || null,
@@ -64,7 +54,6 @@ async function statusCommand(options = {}) {
       port: explicitDesktop.port,
       pid: Number.isFinite(explicitDesktop.pid) ? explicitDesktop.pid : null,
       launchMode: null,
-      passwordProtected: null,
       bindHost: null,
     });
   }
@@ -87,7 +76,7 @@ async function statusCommand(options = {}) {
 
     for (const instance of instances) {
       process.stdout.write(
-        `port ${instance.port} mode:${instance.launchMode || 'n/a'} pass:${toPasswordProtectionLabel(instance.passwordProtected)}\n`
+        `port ${instance.port} mode:${instance.launchMode || 'n/a'}\n`
       );
     }
     return;
@@ -103,9 +92,7 @@ async function statusCommand(options = {}) {
 
   for (const instance of instances) {
     const pidSuffix = Number.isFinite(instance.pid) ? ` (PID: ${instance.pid})` : '';
-    const modeDetail = instance.launchMode ? `mode: ${instance.launchMode}` : '';
-    const protectionDetail = `password: ${toPasswordProtectionLabel(instance.passwordProtected)}`;
-    const detail = modeDetail ? `${modeDetail}; ${protectionDetail}` : protectionDetail;
+    const detail = instance.launchMode ? `mode: ${instance.launchMode}` : '';
     if (instance.runtime === 'desktop') {
       logStatus('info', `desktop app on port ${instance.port}${pidSuffix}`, detail);
     } else {

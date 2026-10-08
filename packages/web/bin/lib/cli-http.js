@@ -1,77 +1,5 @@
 import { buildLocalUrl } from './cli-network.js';
 import { readDesktopLocalClientTokenFromSettings, readDesktopLocalPortFromSettings } from './cli-paths.js';
-import { getInstanceFilePath, readInstanceOptions } from './cli-process.js';
-
-const UI_SESSION_COOKIE_NAME = 'oc_ui_session';
-// The server folds the request port into the cookie name (oc_ui_session_<port>)
-// so LAN instances on different ports don't share one jar (issue #2377). Accept
-// both the bare name and any per-port variant when extracting.
-const UI_SESSION_COOKIE_PATTERN = new RegExp(`(?:^|,\\s*)(${UI_SESSION_COOKIE_NAME}(?:_\\d+)?=[^;]+)`);
-
-function extractUiSessionCookie(response) {
-  const values = [];
-  const direct = response?.headers?.get?.('set-cookie');
-  if (typeof direct === 'string' && direct.length > 0) {
-    values.push(direct);
-  }
-  const getSetCookie = response?.headers?.getSetCookie;
-  if (typeof getSetCookie === 'function') {
-    const setCookies = getSetCookie.call(response.headers);
-    if (Array.isArray(setCookies)) {
-      values.push(...setCookies.filter((value) => typeof value === 'string' && value.length > 0));
-    }
-  }
-  const raw = response?.headers?.raw?.();
-  if (Array.isArray(raw?.['set-cookie'])) {
-    values.push(...raw['set-cookie'].filter((value) => typeof value === 'string' && value.length > 0));
-  }
-
-  for (const setCookie of values) {
-    const match = setCookie.match(UI_SESSION_COOKIE_PATTERN);
-    if (match?.[1]) return match[1];
-  }
-  return null;
-}
-
-async function resolveUiPasswordForPort(port, options = {}) {
-  if (options.explicitUiPassword && typeof options.uiPassword === 'string' && options.uiPassword.trim().length > 0) {
-    return options.uiPassword;
-  }
-  const instanceOptions = readInstanceOptions(await getInstanceFilePath(port));
-  if (typeof instanceOptions?.uiPassword === 'string' && instanceOptions.uiPassword.trim().length > 0) {
-    return instanceOptions.uiPassword;
-  }
-  return typeof options.uiPassword === 'string' && options.uiPassword.trim().length > 0
-    ? options.uiPassword
-    : null;
-}
-
-async function createUiSessionCookie(port, password, timeoutMs) {
-  if (typeof password !== 'string' || password.length === 0) {
-    return null;
-  }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(buildLocalUrl(port, '/auth/session'), {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ password }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      return null;
-    }
-    return extractUiSessionCookie(response);
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 function getDesktopLocalAuthHeader(port, requestHeaders) {
   if (requestHeaders.Authorization || requestHeaders.authorization) {
@@ -108,7 +36,6 @@ async function requestJson(port, endpoint, options = {}) {
     : 4000;
   const fetchOptions = { ...options };
   delete fetchOptions.timeoutMs;
-  delete fetchOptions.uiPassword;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -129,22 +56,6 @@ async function requestJson(port, endpoint, options = {}) {
       signal: controller.signal,
     });
     const body = await response.json().catch(() => null);
-    if (response.status === 401 && body?.error === 'UI authentication required') {
-      const uiPassword = await resolveUiPasswordForPort(port, options);
-      const cookie = await createUiSessionCookie(port, uiPassword, timeoutMs);
-      if (cookie) {
-        const retryResponse = await fetch(requestUrl, {
-          ...fetchOptions,
-          headers: {
-            ...requestHeaders,
-            Cookie: cookie,
-          },
-          signal: controller.signal,
-        });
-        const retryBody = await retryResponse.json().catch(() => null);
-        return { response: retryResponse, body: retryBody };
-      }
-    }
     return { response, body };
   } catch (error) {
     if (error && (error.name === 'AbortError' || error.code === 'ABORT_ERR')) {

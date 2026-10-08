@@ -28,7 +28,6 @@ import {
   TUNNEL_PROVIDER_NGROK,
 } from '../server/lib/tunnels/types.js';
 import {
-  assertAuthenticatedNetworkExposure,
   commands,
   discoverOpenChamberInstanceOnPort,
   discoverLifecycleInstances,
@@ -36,14 +35,12 @@ import {
   discoverUnconfirmedRegistryInstanceOnPort,
   ensureTunnelProfilesMigrated,
   EXIT_CODE,
-  generateUiPassword,
   getInstanceFilePath,
   getPidFilePath,
   isOpenchamberCmdline,
   isOpenchamberProcessRunning,
   parseArgs,
   resolveServeHost,
-  resolveServeUiPassword,
 } from './cli.js';
 import { buildWindowsStartupTaskCommand } from './lib/cli-startup.js';
 
@@ -612,14 +609,13 @@ describe('cli args', () => {
   });
 
   it('parses tunnel auto-start server options', () => {
-    const parsed = parseArgs(['tunnel', 'start', '--port', '3002', '--api-only', '--lan', '--ui-password', 'secret']);
+    const parsed = parseArgs(['tunnel', 'start', '--port', '3002', '--api-only', '--lan']);
 
     expect(parsed.command).toBe('tunnel');
     expect(parsed.subcommand).toBe('start');
     expect(parsed.options.port).toBe(3002);
     expect(parsed.options.apiOnly).toBe(true);
     expect(parsed.options.host).toBe('0.0.0.0');
-    expect(parsed.options.uiPassword).toBe('secret');
   });
 
   it('maps --lan to wildcard bind host', () => {
@@ -687,71 +683,14 @@ describe('cli API target resolution', () => {
   });
 });
 
-describe('network-exposed auth validation', () => {
-  it('allows loopback without a UI password', () => {
-    expect(() => assertAuthenticatedNetworkExposure({ host: '127.0.0.1' })).not.toThrow();
-    expect(() => assertAuthenticatedNetworkExposure({ host: 'localhost' })).not.toThrow();
-    expect(() => assertAuthenticatedNetworkExposure({ host: '::1' })).not.toThrow();
-  });
-
-  it('requires a UI password for LAN and wildcard bind hosts', () => {
-    expect(() => assertAuthenticatedNetworkExposure({ host: '0.0.0.0' })).toThrow(/refuses to bind/);
-    expect(() => assertAuthenticatedNetworkExposure({ host: '192.168.1.10' })).toThrow(/refuses to bind/);
-  });
-
-  it('allows network-exposed bind hosts with a UI password', () => {
-    expect(() => assertAuthenticatedNetworkExposure({ host: '0.0.0.0', uiPassword: 'secret' })).not.toThrow();
-  });
-
-  it('allows explicit unsafe LAN override from process env only', () => {
-    const previous = process.env.OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN;
-    process.env.OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN = 'true';
-    try {
-      expect(() => assertAuthenticatedNetworkExposure({ host: '0.0.0.0' })).not.toThrow();
-    } finally {
-      if (typeof previous === 'string') {
-        process.env.OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN = previous;
-      } else {
-        delete process.env.OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN;
-      }
-    }
-  });
-});
-
-describe('serve UI password resolution', () => {
-  it('keeps a configured password untouched', () => {
-    expect(resolveServeUiPassword({ uiPassword: 'secret', explicitUiPassword: true }))
-      .toEqual({ password: 'secret', generated: false });
-  });
-
-  it('generates a password for an explicit --ui-password flag without a value', () => {
-    const resolved = resolveServeUiPassword({ uiPassword: '', explicitUiPassword: true });
-    expect(resolved.generated).toBe(true);
-    expect(typeof resolved.password).toBe('string');
-    expect(resolved.password.length).toBe(16);
-  });
-
-  it('does not generate a password when the flag is absent', () => {
-    expect(resolveServeUiPassword({ uiPassword: undefined, explicitUiPassword: false }))
-      .toEqual({ password: undefined, generated: false });
-  });
-
-  it('generates passwords from an ambiguity-free charset', () => {
-    const resolved = resolveServeUiPassword({ uiPassword: '', explicitUiPassword: true });
-    expect(resolved.password).toMatch(/^[A-HJ-NP-Za-km-z2-9]{16}$/);
-    expect(resolved.password).not.toMatch(/[0O1Il]/);
-  });
-
-  it('generates distinct passwords on repeated calls', () => {
-    const a = generateUiPassword();
-    const b = generateUiPassword();
-    expect(a).not.toBe(b);
-  });
-
-  it('parses --ui-password without a value as explicit but empty', () => {
-    const parsed = parseArgs(['serve', '--ui-password']);
-    expect(parsed.options.explicitUiPassword).toBe(true);
-    expect(parsed.options.uiPassword).toBe('');
+describe('removed --ui-password flag', () => {
+  it('rejects --ui-password with a pointer to Alcore login', () => {
+    expect(parseArgs(['serve', '--ui-password']).removedFlagErrors).toEqual([
+      '`--ui-password` was removed. Browser auth now uses Alcore login.',
+    ]);
+    expect(parseArgs(['tunnel', 'start', '--ui-password', 'secret']).removedFlagErrors).toEqual([
+      '`--ui-password` was removed. Browser auth now uses Alcore login.',
+    ]);
   });
 });
 
@@ -853,25 +792,13 @@ describe('CLI HTTP helpers', () => {
     }
   });
 
-  it.each(['oc_ui_session', 'oc_ui_session_3000'])('retries UI-authenticated API requests with the %s cookie', async (cookieName) => {
+  it('passes a 401 through without a password-cookie retry', async () => {
     await withTempOpenChamberDataDir(async () => {
       const port = 45678;
-      fs.writeFileSync(await getInstanceFilePath(port), JSON.stringify({ port, uiPassword: 'secret' }, null, 2));
       const originalFetch = globalThis.fetch;
       const calls = [];
       globalThis.fetch = async (url, options = {}) => {
         calls.push({ url: String(url), options });
-        if (String(url).endsWith('/auth/session')) {
-          expect(JSON.parse(options.body)).toEqual({ password: 'secret' });
-          return {
-            ok: true,
-            headers: { get: (name) => name.toLowerCase() === 'set-cookie' ? `${cookieName}=session-token; Path=/; HttpOnly` : null },
-            json: async () => ({ authenticated: true }),
-          };
-        }
-        if (options.headers?.Cookie === `${cookieName}=session-token`) {
-          return createMockJsonResponse({ ok: true });
-        }
         return {
           ok: false,
           status: 401,
@@ -885,52 +812,12 @@ describe('CLI HTTP helpers', () => {
           body: JSON.stringify({ provider: 'ngrok', mode: 'quick' }),
         });
 
-        expect(response.ok).toBe(true);
-        expect(body).toEqual({ ok: true });
-        expect(calls.at(-1).options.headers.Cookie).toBe(`${cookieName}=session-token`);
+        expect(response.status).toBe(401);
+        expect(body).toEqual({ error: 'UI authentication required', locked: true });
+        // No password exists anymore: the CLI must not call /auth/session.
         expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
           '/api/openchamber/tunnel/start',
-          '/auth/session',
-          '/api/openchamber/tunnel/start',
         ]);
-      } finally {
-        globalThis.fetch = originalFetch;
-      }
-    });
-  });
-
-  it.each(['oc_ui_session', 'oc_ui_session_3000'])('uses the stored password and getSetCookie for %s', async (cookieName) => {
-    await withTempOpenChamberDataDir(async () => {
-      const port = 45679;
-      fs.writeFileSync(await getInstanceFilePath(port), JSON.stringify({ port, uiPassword: 'stored-secret' }, null, 2));
-      const originalFetch = globalThis.fetch;
-      globalThis.fetch = async (url, options = {}) => {
-        if (String(url).endsWith('/auth/session')) {
-          expect(JSON.parse(options.body)).toEqual({ password: 'stored-secret' });
-          return {
-            ok: true,
-            headers: { getSetCookie: () => [`${cookieName}=session-token; Path=/; HttpOnly`] },
-            json: async () => ({ authenticated: true }),
-          };
-        }
-        if (options.headers?.Cookie === `${cookieName}=session-token`) {
-          return createMockJsonResponse({ ok: true });
-        }
-        return {
-          ok: false,
-          status: 401,
-          json: async () => ({ error: 'UI authentication required', locked: true }),
-        };
-      };
-
-      try {
-        const { response, body } = await requestJson(port, '/api/openchamber/scheduled-tasks/status', {
-          uiPassword: 'stale-env-secret',
-          explicitUiPassword: false,
-        });
-
-        expect(response.ok).toBe(true);
-        expect(body).toEqual({ ok: true });
       } finally {
         globalThis.fetch = originalFetch;
       }

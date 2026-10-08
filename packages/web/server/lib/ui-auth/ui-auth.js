@@ -397,7 +397,7 @@ const buildCookie = ({
   return attributes.join('; ');
 };
 
-// Alcore login (Wave 1): replaces the --ui-password gate. Browser access
+// Alcore login (Wave 1): replaces the legacy password gate. Browser access
 // requires a valid Alcore access token (HS256 JWT minted by the Alcore auth
 // service: { sub, sid, iss, aud: 'auth', intent: 'session', exp }), exchanged
 // via POST /auth/session for a port-scoped UI session cookie, or presented

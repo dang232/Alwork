@@ -8,10 +8,6 @@ import { isModuleCliExecution } from './cli-entry.js';
 import { EXIT_CODE, TunnelCliError } from './lib/cli-errors.js';
 import {
   resolveServeHost,
-  hasUiPasswordConfigured,
-  generateUiPassword,
-  resolveServeUiPassword,
-  assertAuthenticatedNetworkExposure,
 } from './lib/cli-network.js';
 import {
   maskToken,
@@ -437,11 +433,7 @@ export {
   main,
   commands,
   parseArgs,
-  assertAuthenticatedNetworkExposure,
   resolveServeHost,
-  hasUiPasswordConfigured,
-  generateUiPassword,
-  resolveServeUiPassword,
   shouldDisplayTunnelQr,
   isValidTunnelDoctorResponse,
   readDesktopLocalPortFromSettings,

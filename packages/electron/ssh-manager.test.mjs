@@ -375,7 +375,7 @@ printf '4321\\n'`);
     }
   });
 
-  test('stores a client token for forwarded OpenChamber hosts when UI password is configured', async () => {
+  test('stores a client token for forwarded OpenChamber hosts when a UI secret is configured', async () => {
     let loginPayload = null;
     const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && req.url === '/auth/session') {
@@ -401,7 +401,7 @@ printf '4321\\n'`);
 
     const settings = JSON.parse(fs.readFileSync(settingsFilePath, 'utf8'));
     expect(loginPayload).toMatchObject({
-      password: 'ui-secret',
+      alcoreToken: 'ui-secret',
       trustDevice: true,
       issueClientToken: true,
     });
@@ -600,7 +600,7 @@ printf '4321\\n'`);
 
     expect(scripts).toEqual(["'/home/pi/.bun/bin/openchamber' stop --port 41777"]);
   });
-  test('publishes the remote server to its network only with a UI password', async () => {
+  test('publishes the remote server to its network only with its UI secret', async () => {
     const manager = new ElectronSshManager({
       settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
       appVersion: '1.2.3',
@@ -621,7 +621,7 @@ printf '4321\\n'`);
     };
 
     await expect(manager.startRemoteServerManaged(parsed, '/tmp/control.sock', exposed, 4321, '/bin/openchamber'))
-      .rejects.toThrow(/requires a UI password/);
+      .rejects.toThrow(/requires its UI secret/);
 
     const secured = {
       ...exposed,
@@ -653,8 +653,8 @@ printf '4321\\n'`);
         if (probedPort) {
           const server = host.servers.find((entry) => entry.port === Number(probedPort[1]));
           if (!server) return 'INFO_STATUS=000\nAUTH_STATUS=0\nHEALTH_STATUS=000\n';
-          // /api/system/info is public, so only the auth status tells a fitting password apart.
-          const offered = script.match(/"password":"([^"]*)"/);
+          // /api/system/info is public, so only the auth status tells a fitting secret apart.
+          const offered = script.match(/"alcoreToken":"([^"]*)"/);
           let authStatus = 0;
           if (offered) authStatus = !server.password ? 400 : offered[1] === server.password ? 200 : 401;
           if (offered && server.rateLimited) authStatus = 429;
@@ -679,7 +679,7 @@ printf '4321\\n'`);
         const servedPort = script.match(/ serve --hostname (\S+) --port (\d+)$/);
         if (servedPort) {
           host.started.push(Number(servedPort[2]));
-          const servedPassword = script.match(/OPENCHAMBER_UI_PASSWORD='([^']*)'/);
+          const servedPassword = script.match(/ALCORE_JWT_SECRET='([^']*)'/);
           host.servers.push({ port: Number(servedPort[2]), version: '1.2.3', bindHost: servedPort[1], password: servedPassword?.[1] });
           return `${servedPort[2]}\n`;
         }
@@ -733,26 +733,26 @@ printf '4321\\n'`);
       expect(host.servers.map((entry) => entry.bindHost)).toEqual(['0.0.0.0']);
     });
 
-    const withPassword = (value, remoteOpenchamber) => ({
+    const withSecret = (value, remoteOpenchamber) => ({
       ...managed(remoteOpenchamber),
       auth: { openchamberPassword: { enabled: true, value, store: 'settings' } },
     });
 
-    test('neither reuses nor stops a server that rejects the instance password', async () => {
+    test('neither reuses nor stops a server that rejects the instance secret', async () => {
       const { host, manager } = createRemoteHost([
         { port: 30001, version: '1.2.3', password: 'old-secret' },
         { port: 30002, version: '1.1.0', password: 'someone-else' },
         { port: 30003, version: '1.2.3' },
       ]);
 
-      const result = await manager.ensureRemoteServer(withPassword('new-secret'), parsed, '/unused.sock');
+      const result = await manager.ensureRemoteServer(withSecret('new-secret'), parsed, '/unused.sock');
 
       expect(host.stopped).toEqual([]);
       expect(result.startedByUs).toBe(true);
       expect(host.servers.find((entry) => entry.port === result.remotePort).password).toBe('new-secret');
     });
 
-    test('an instance without a password leaves password-protected servers alone', async () => {
+    test('an instance without a secret leaves secret-protected servers alone', async () => {
       const { host, manager } = createRemoteHost([{ port: 30001, version: '1.1.0', password: 'secret' }]);
 
       const result = await manager.ensureRemoteServer(managed(), parsed, '/unused.sock');
@@ -761,13 +761,13 @@ printf '4321\\n'`);
       expect(result.remotePort).not.toBe(30001);
     });
 
-    test('reuses the server that accepts the instance password', async () => {
+    test('reuses the server that accepts the instance secret', async () => {
       const { host, manager } = createRemoteHost([
         { port: 30001, version: '1.2.3', password: 'someone-else' },
         { port: 30002, version: '1.2.3', password: 'remote-secret' },
       ]);
 
-      const result = await manager.ensureRemoteServer(withPassword('remote-secret'), parsed, '/unused.sock');
+      const result = await manager.ensureRemoteServer(withSecret('remote-secret'), parsed, '/unused.sock');
 
       expect(result).toMatchObject({ remotePort: 30002, startedByUs: false });
       expect(host.started).toEqual([]);
@@ -784,7 +784,7 @@ printf '4321\\n'`);
     test('replaces a server still published to the network after the instance stopped publishing', async () => {
       const { host, manager } = createRemoteHost([{ port: 30001, version: '1.2.3', bindHost: '0.0.0.0', password: 'remote-secret' }]);
 
-      await manager.ensureRemoteServer(withPassword('remote-secret'), parsed, '/unused.sock');
+      await manager.ensureRemoteServer(withSecret('remote-secret'), parsed, '/unused.sock');
 
       expect(host.stopped).toEqual([30001]);
       expect(host.servers.map((entry) => entry.bindHost)).toEqual(['127.0.0.1']);
@@ -802,10 +802,10 @@ printf '4321\\n'`);
     test('says in the connect log why a registered server was passed over', async () => {
       const { host, manager } = createRemoteHost([{ port: 30001, version: '1.1.0', password: 'remote-secret', rateLimited: true }]);
 
-      await manager.ensureRemoteServer(withPassword('remote-secret'), parsed, '/unused.sock');
+      await manager.ensureRemoteServer(withSecret('remote-secret'), parsed, '/unused.sock');
 
       expect(host.stopped).toEqual([]);
-      expect(manager.logsForInstance('ssh-reuse', 50).join('\n')).toContain('remote port 30001: it does not take this instance\'s UI password (auth status 429)');
+      expect(manager.logsForInstance('ssh-reuse', 50).join('\n')).toContain('remote port 30001: it does not take this instance\'s UI secret (auth status 429)');
     });
 
     test('disconnecting with keepRunning off stops an adopted daemon', async () => {

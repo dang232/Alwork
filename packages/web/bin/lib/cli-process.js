@@ -57,8 +57,6 @@ function writeInstanceOptions(instanceFilePath, options, onNotice) {
       port: options.port,
       host: typeof options.host === 'string' && options.host.length > 0 ? options.host : undefined,
       launchMode: options.launchMode === 'foreground' ? 'foreground' : 'daemon',
-      uiPassword: typeof options.uiPassword === 'string' ? options.uiPassword : undefined,
-      hasUiPassword: typeof options.uiPassword === 'string',
       apiOnly: options.apiOnly === true,
       startedAt: Number.isFinite(options.startedAt) ? options.startedAt : Date.now(),
     };

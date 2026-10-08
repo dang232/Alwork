@@ -112,9 +112,7 @@ function createUpdateCommand({ importFromFilePath, packageManagerPath, serveComm
           port: storedOptions.port || instance.port,
           host: storedOptions.host,
           explicitPort: true,
-          uiPassword: storedOptions.uiPassword,
           suppressStartupSummary: true,
-          suppressUiPasswordWarning: true,
           quiet: true,
         });
       }

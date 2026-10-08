@@ -764,7 +764,7 @@ headers }` or v1 `{ npm, options }`. The stored entry is always a
 
 ## Public exports (cli-options.js)
 - `parseServeCliOptions(options)`: parses serve CLI flags and environment-derived defaults:
-  - Port/host/ui-password
+  - Port/host/Alcore secret
   - Tunnel provider/mode/config/token/hostname
   - Legacy `--tunnel` shorthand normalization
 
@@ -814,7 +814,7 @@ headers }` or v1 `{ npm, options }`. The stored entry is always a
 ## Public exports (tunnel-wiring-runtime.js)
 - `createTunnelWiringRuntime(dependencies)`: creates runtime for tunnel service construction and tunnel route registration.
 - Returned API:
-  - `initialize(app, initialPort, hasUiPassword)`
+  - `initialize(app, initialPort)`
 
 ## Public exports (startup-pipeline-runtime.js)
 - `createStartupPipelineRuntime(dependencies)`: creates runtime for terminal wiring, proxy/bootstrap scheduling, static route registration, and server startup/listen flow.

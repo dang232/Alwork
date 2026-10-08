@@ -878,9 +878,9 @@ export class ElectronSshManager {
     await writeJsonRoot(this.settingsFilePath, root);
   }
 
-  async issueClientToken(localUrl, openchamberPassword) {
-    const password = typeof openchamberPassword === 'string' ? openchamberPassword.trim() : '';
-    if (!password) return '';
+  async issueClientToken(localUrl, alcoreSecret) {
+    const secret = typeof alcoreSecret === 'string' ? alcoreSecret.trim() : '';
+    if (!secret) return '';
 
     const loginResponse = await fetch(new URL('/auth/session', `${localUrl}/`).toString(), {
       method: 'POST',
@@ -890,14 +890,14 @@ export class ElectronSshManager {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        password,
+        alcoreToken: secret,
         trustDevice: true,
         issueClientToken: true,
         clientLabel: 'OpenChamber Desktop SSH',
       }),
     });
     if (!loginResponse.ok) {
-      throw new Error(`Configured OpenChamber UI password was rejected by forwarded server (status ${loginResponse.status})`);
+      throw new Error(`The stored UI secret was rejected by the forwarded server (status ${loginResponse.status})`);
     }
 
     const payload = await loginResponse.json().catch(() => null);
@@ -1110,15 +1110,15 @@ export class ElectronSshManager {
     throw lastError || new Error('Failed to install OpenChamber on remote host');
   }
 
-  async probeRemoteSystemInfo(parsed, controlPath, port, openchamberPassword) {
-    return (await this.probeRemoteServer(parsed, controlPath, port, openchamberPassword)).info;
+  async probeRemoteSystemInfo(parsed, controlPath, port, alcoreSecret) {
+    return (await this.probeRemoteServer(parsed, controlPath, port, alcoreSecret)).info;
   }
 
-  // `passwordAccepted` is reported on its own because /api/system/info is
-  // public: a server answers it whether or not the password fits.
-  async probeRemoteServer(parsed, controlPath, port, openchamberPassword) {
-    const authPayload = openchamberPassword ? JSON.stringify({ password: openchamberPassword }) : '{}';
-    const authEnabled = openchamberPassword ? '1' : '0';
+  // `alcoreAccepted` is reported on its own because /api/system/info is
+  // public: a server answers it whether or not the secret fits.
+  async probeRemoteServer(parsed, controlPath, port, alcoreSecret) {
+    const authPayload = alcoreSecret ? JSON.stringify({ alcoreToken: alcoreSecret }) : '{}';
+    const authEnabled = alcoreSecret ? '1' : '0';
     const script = `AUTH_STATUS=0; INFO_STATUS=0; HEALTH_STATUS=0; BODY_FILE="$(mktemp)"; COOKIE_FILE="$(mktemp)"; cleanup(){ rm -f "$BODY_FILE" "$COOKIE_FILE"; }; trap cleanup EXIT; if command -v curl >/dev/null 2>&1; then if [ "${authEnabled}" = "1" ]; then AUTH_STATUS="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' -c "$COOKIE_FILE" -H 'content-type: application/json' --data ${shellQuote(authPayload)} http://127.0.0.1:${port}/auth/session || true)"; if [ "$AUTH_STATUS" = "200" ]; then INFO_STATUS="$(curl -sS --max-time 3 -b "$COOKIE_FILE" -o "$BODY_FILE" -w '%{http_code}' http://127.0.0.1:${port}/api/system/info || true)"; else INFO_STATUS="$(curl -sS --max-time 3 -o "$BODY_FILE" -w '%{http_code}' http://127.0.0.1:${port}/api/system/info || true)"; fi; else INFO_STATUS="$(curl -sS --max-time 3 -o "$BODY_FILE" -w '%{http_code}' http://127.0.0.1:${port}/api/system/info || true)"; fi; HEALTH_STATUS="$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:${port}/health || true)"; elif command -v wget >/dev/null 2>&1; then wget -qO "$BODY_FILE" http://127.0.0.1:${port}/api/system/info >/dev/null 2>&1; if [ $? -eq 0 ]; then INFO_STATUS=200; fi; wget -qO- http://127.0.0.1:${port}/health >/dev/null 2>&1; if [ $? -eq 0 ]; then HEALTH_STATUS=200; fi; else exit 127; fi; printf 'INFO_STATUS=%s\\nAUTH_STATUS=%s\\nHEALTH_STATUS=%s\\n' "$INFO_STATUS" "$AUTH_STATUS" "$HEALTH_STATUS"; cat "$BODY_FILE" 2>/dev/null || true`;
     const output = await this.runRemoteCommand(parsed, controlPath, script);
     const lines = output.split(/\r?\n/);
@@ -1126,32 +1126,32 @@ export class ElectronSshManager {
     const authStatus = parseProbeStatusLine(lines[1], 'AUTH_STATUS=') || 0;
     const healthStatus = parseProbeStatusLine(lines[2], 'HEALTH_STATUS=') || 0;
     const body = lines.slice(3).join('\n');
-    const passwordAccepted = authStatus === 200;
+    const alcoreAccepted = authStatus === 200;
 
     if (isLivenessHttpStatus(infoStatus)) {
       if (isAuthHttpStatus(infoStatus)) {
-        if (openchamberPassword && authStatus !== 200) {
-          throw new Error(`Remote OpenChamber requires UI authentication and configured password was rejected (auth status ${authStatus})`);
+        if (alcoreSecret && authStatus !== 200) {
+          throw new Error(`Remote OpenChamber requires UI authentication and the configured secret was rejected (auth status ${authStatus})`);
         }
-        if (isLivenessHttpStatus(healthStatus)) return { info: {}, passwordAccepted, authStatus };
-        throw new Error('Remote OpenChamber requires UI authentication on /api/system/info; configure OpenChamber UI password');
+        if (isLivenessHttpStatus(healthStatus)) return { info: {}, alcoreAccepted, authStatus };
+        throw new Error("Remote OpenChamber requires UI authentication on /api/system/info; enter this host's UI secret in its settings");
       }
     } else if (isLivenessHttpStatus(healthStatus)) {
-      return { info: {}, passwordAccepted, authStatus };
+      return { info: {}, alcoreAccepted, authStatus };
     } else {
       throw new Error(`Remote OpenChamber probe failed (info status ${infoStatus}, health status ${healthStatus})`);
     }
 
     try {
-      return { info: JSON.parse(body), passwordAccepted, authStatus };
+      return { info: JSON.parse(body), alcoreAccepted, authStatus };
     } catch {
-      return { info: {}, passwordAccepted, authStatus };
+      return { info: {}, alcoreAccepted, authStatus };
     }
   }
 
-  async remoteServerRunning(parsed, controlPath, port, openchamberPassword) {
+  async remoteServerRunning(parsed, controlPath, port, alcoreSecret) {
     try {
-      await this.probeRemoteSystemInfo(parsed, controlPath, port, openchamberPassword);
+      await this.probeRemoteSystemInfo(parsed, controlPath, port, alcoreSecret);
       return true;
     } catch {
       return false;
@@ -1167,14 +1167,15 @@ export class ElectronSshManager {
     const secret = this.configuredOpenChamberPassword(instance);
     const remoteBindHost = instance.remoteOpenchamber?.bindHost === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
     // Binding the remote server to every interface publishes its UI to the
-    // remote machine's whole network, so it may not run without a password.
+    // remote machine's whole network, so it may not run without its UI secret,
+    // which becomes that server's Alcore secret for browser login.
     if (remoteBindHost === '0.0.0.0' && !secret) {
-      throw new Error('Exposing the remote server to its network requires a UI password');
+      throw new Error("Exposing the remote server to its network requires its UI secret (browser login uses Alcore, so the secret is provisioned as the remote server's Alcore secret)");
     }
 
     let envPrefix = `PATH="${REMOTE_PATH_PREFIX}:$PATH" OPENCODE_BINARY=${shellQuote(opencodePath)} OPENCHAMBER_RUNTIME=ssh-remote`;
     if (secret) {
-      envPrefix += ` OPENCHAMBER_UI_PASSWORD=${shellQuote(secret)}`;
+      envPrefix += ` ALCORE_JWT_SECRET=${shellQuote(secret)}`;
     }
     const output = await this.runRemoteCommand(parsed, controlPath, `${envPrefix} ${shellQuote(binPath)} serve --hostname ${remoteBindHost} --port ${desiredPort}`);
     const port = output.split(/\s+/).map((token) => Number.parseInt(token, 10)).find((value) => Number.isFinite(value));
@@ -1182,7 +1183,7 @@ export class ElectronSshManager {
   }
 
   // `openchamber stop` owns the daemon lifecycle. The HTTP shutdown route sits
-  // behind UI authentication, so it cannot stop a password-protected server.
+  // behind UI authentication, so it cannot stop an auth-protected server.
   async stopRemoteServerBestEffort(parsed, controlPath, remotePort, remoteBinPath) {
     if (!remoteBinPath) return;
     try {
@@ -1263,7 +1264,7 @@ export class ElectronSshManager {
   // `daemon` marks a server the remote CLI started in the background, the only
   // kind this manager may stop.
   async adoptRunningRemoteServer(instance, parsed, controlPath, binPath) {
-    const password = this.configuredOpenChamberPassword(instance);
+    const secret = this.configuredOpenChamberPassword(instance);
     const preferredPort = instance.remoteOpenchamber.preferredPort || null;
     const wantsNetwork = instance.remoteOpenchamber.bindHost === '0.0.0.0';
 
@@ -1282,18 +1283,18 @@ export class ElectronSshManager {
     for (const server of servers) {
       let probe;
       try {
-        probe = await this.probeRemoteServer(parsed, controlPath, server.port, password);
+        probe = await this.probeRemoteServer(parsed, controlPath, server.port, secret);
       } catch (error) {
-        // The probe command carries the UI password, and a remote shell may echo it.
-        this.appendLogWithLevel(instance.id, 'INFO', `Not reusing the server on remote port ${server.port}: ${sanitizeProcessDiagnostic(error instanceof Error ? error.message : String(error), password)}`);
+        // The probe command carries the UI secret, and a remote shell may echo it.
+        this.appendLogWithLevel(instance.id, 'INFO', `Not reusing the server on remote port ${server.port}: ${sanitizeProcessDiagnostic(error instanceof Error ? error.message : String(error), secret)}`);
         continue;
       }
       // A server that answers is not yet ours: it has to take this instance's
-      // password, or have none when the instance has none. Anything else belongs
+      // secret, or have none when the instance has none. Anything else belongs
       // to someone else and is neither reused nor stopped.
-      const passwordFits = password ? probe.passwordAccepted : server.passwordProtected !== true;
-      if (!passwordFits) {
-        this.appendLogWithLevel(instance.id, 'INFO', `Not reusing the server on remote port ${server.port}: it does not take this instance's UI password (auth status ${probe.authStatus})`);
+      const secretFits = secret ? probe.alcoreAccepted : server.passwordProtected !== true;
+      if (!secretFits) {
+        this.appendLogWithLevel(instance.id, 'INFO', `Not reusing the server on remote port ${server.port}: it does not take this instance's UI secret (auth status ${probe.authStatus})`);
         continue;
       }
       const { info } = probe;
@@ -1315,7 +1316,7 @@ export class ElectronSshManager {
       }
       this.appendLogWithLevel(instance.id, 'INFO', `Replacing the managed server on remote port ${server.port}: ${otherVersion ? `it runs OpenChamber ${runningVersion}` : `it is bound to ${server.bindHost}`}`);
       await this.stopRemoteServerBestEffort(parsed, controlPath, server.port, binPath);
-      if (await this.remoteServerRunning(parsed, controlPath, server.port, password)) {
+      if (await this.remoteServerRunning(parsed, controlPath, server.port, secret)) {
         this.appendLogWithLevel(instance.id, 'WARN', `The managed server on remote port ${server.port} did not stop and keeps running`);
         // Nothing else can start on a pinned port while this one holds it.
         if (server.port === preferredPort) return adopted;

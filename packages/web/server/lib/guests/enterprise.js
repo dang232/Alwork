@@ -39,7 +39,8 @@ const repositoryKey = (value) => {
   return cleanPath ? `${host.toLowerCase()}/${cleanPath}` : null;
 };
 
-const isAllowedRepository = (gitUrl, allowed) => {
+/** Whether a clone URL names a repository the administrator listed. Shared by install-time and load-time enforcement, so both agree on spellings. */
+export const isAllowedRepository = (gitUrl, allowed) => {
   const key = gitUrl ? repositoryKey(gitUrl) : null;
   if (key === null) return false;
   return allowed.some((entry) => {

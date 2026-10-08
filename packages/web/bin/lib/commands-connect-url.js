@@ -238,10 +238,8 @@ function createConnectUrlCommand({ serveCommand }) {
             port: options.port,
             explicitPort: true,
             host: options.host,
-            uiPassword: options.uiPassword,
             apiOnly: options.apiOnly,
             suppressUnsafePortWarning: true,
-            suppressUiPasswordWarning: true,
             suppressStartupSummary: true,
             suppressQuietOutput: true,
           });

@@ -2339,7 +2339,7 @@ async function main(options = {}) {
     isRequestOriginAllowed,
   });
 
-  const tunnelRuntimeContext = tunnelWiringRuntime.initialize(app, port, true);
+  const tunnelRuntimeContext = tunnelWiringRuntime.initialize(app, port);
   const { tunnelService, startTunnelWithNormalizedRequest } = tunnelRuntimeContext;
   tunnelRuntimeContextHolder = tunnelRuntimeContext;
 

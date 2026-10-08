@@ -350,11 +350,9 @@ async function restartCommand(options, serveCommand) {
           port: restartPort,
           host: instanceHost,
           explicitPort: true,
-          uiPassword: options.explicitUiPassword ? options.uiPassword : (storedOptions.uiPassword || options.uiPassword),
           apiOnly: storedOptions.apiOnly === true || options.apiOnly === true,
           suppressStartupSummary: true,
           quiet: true,
-          suppressUiPasswordWarning: true,
           suppressQuietOutput: true,
         });
         restarted.push({ fromPort: instance.port, toPort: restartedPort, launchMode, ok: true });

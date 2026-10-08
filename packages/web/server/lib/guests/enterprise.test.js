@@ -7,7 +7,7 @@ import { listInstalledGuests, toPublicGuest } from './catalog.js';
 import { enterpriseBlockedCapabilities } from './enterprise.js';
 import { guestGrantScope } from './grant-scope.js';
 import { installGuestFromPath } from './install.js';
-import { setCapabilityGrants } from './persist.js';
+import { readExtensionStore, setCapabilityGrants, writeExtensionStore } from './persist.js';
 
 const enterprise = (allowedExtensions = []) => ({ enterpriseMode: true, allowedExtensions });
 const withOrigins = { origins: ['https://api.acme.test'] };
@@ -106,5 +106,73 @@ describe('extensions in enterprise mode', () => {
     expect(restored.enterpriseBlocked).toBeUndefined();
     expect(restored.capabilityGrants).toEqual(['origins']);
     expect(toPublicGuest(restored).storageId).toEqual(expect.any(String));
+  });
+});
+
+describe('slot allowlist enforcement at load', () => {
+  const seedGitGuest = async (dir, id, url) => {
+    const pkgDir = path.join(dir, id);
+    await writeGuest(pkgDir, id);
+    const root = await fs.realpath(pkgDir);
+    const persistPath = path.join(dir, 'extensions.json');
+    await writeExtensionStore(persistPath, {
+      paths: [root],
+      sources: { [root]: 'git' },
+      gitOrigins: { [root]: { url } },
+    });
+    return persistPath;
+  };
+  const warnings = () => {
+    const lines = [];
+    const original = console.warn;
+    console.warn = (...args) => { lines.push(args.join(' ')); };
+    return { lines, restore: () => { console.warn = original; } };
+  };
+
+  afterEach(() => {
+    delete process.env.OPENCHAMBER_ENTERPRISE_MODE;
+    delete process.env.OPENCHAMBER_ALLOWED_EXTENSIONS;
+  });
+
+  test('an allowlisted git package loads', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-slot-'));
+    const url = 'https://github.com/acme/ext';
+    const persistPath = await seedGitGuest(dir, 'slot-ok', url);
+    process.env.OPENCHAMBER_ENTERPRISE_MODE = '1';
+    process.env.OPENCHAMBER_ALLOWED_EXTENSIONS = url;
+    const guests = await listInstalledGuests({ persistPath });
+    expect(guests.map((guest) => guest.id)).toEqual(['slot-ok']);
+  });
+
+  test('a non-allowlisted git package is refused at load even when installed, with a logged reason', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-slot-'));
+    const persistPath = await seedGitGuest(dir, 'slot-out', 'https://github.com/evil/ext');
+    process.env.OPENCHAMBER_ENTERPRISE_MODE = '1';
+    const watch = warnings();
+    try {
+      expect(await listInstalledGuests({ persistPath })).toEqual([]);
+    } finally {
+      watch.restore();
+    }
+    expect(watch.lines.some((line) => line.includes('slot-out') && line.includes('allowedExtensions'))).toBe(true);
+    // The refusal is at load: the install itself is kept, and listing the
+    // repository later loads it without reinstalling.
+    expect((await readExtensionStore(persistPath)).paths).toHaveLength(1);
+    process.env.OPENCHAMBER_ALLOWED_EXTENSIONS = 'https://github.com/evil/ext';
+    expect((await listInstalledGuests({ persistPath })).map((guest) => guest.id)).toEqual(['slot-out']);
+  });
+
+  test('a git package with an unreadable origin is refused', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-slot-'));
+    const persistPath = await seedGitGuest(dir, 'slot-bad', 'not a repository url');
+    process.env.OPENCHAMBER_ENTERPRISE_MODE = '1';
+    process.env.OPENCHAMBER_ALLOWED_EXTENSIONS = 'https://github.com/acme/ext';
+    expect(await listInstalledGuests({ persistPath })).toEqual([]);
+  });
+
+  test('git packages load untouched outside enterprise mode', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-slot-'));
+    const persistPath = await seedGitGuest(dir, 'slot-free', 'https://github.com/evil/ext');
+    expect((await listInstalledGuests({ persistPath })).map((guest) => guest.id)).toEqual(['slot-free']);
   });
 });

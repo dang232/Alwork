@@ -6,7 +6,7 @@ import { parseManifestJson } from '@openchamber/sdk/schemas';
 
 import { listRelativeGuestScriptHrefs, resolveGuestHtmlRelativePath } from './html-tokens.js';
 import { effectiveGrants, guestGrantScope } from './grant-scope.js';
-import { enterpriseBlockedCapabilities } from './enterprise.js';
+import { enterpriseBlockedCapabilities, isAllowedRepository } from './enterprise.js';
 import { readEnterprisePolicy } from '../enterprise-mode.js';
 import { ensureGuestStorageIds, onExtensionStoreWrite, readExtensionStore } from './persist.js';
 import { buildPublicSocketBindings } from './sockets.js';
@@ -459,19 +459,34 @@ onExtensionStoreWrite(invalidateGuestCatalog);
  * none of them, and `enterpriseBlocked` names them for Settings. Every route
  * and proxy takes grants from this row, so none of them can use the refused
  * capabilities.
+ *
+ * Allowlist enforcement at load: a Git package from a repository the
+ * administrator did not list never loads, even when it is installed and
+ * approved. Store or registry membership cannot bypass the policy; the
+ * refusal is logged with its reason. Packages without a repository origin
+ * (built-ins, local folders, ZIP copies) keep the grant-narrowing below.
  */
 const withEnterprisePolicy = (guests) => {
   const policy = readEnterprisePolicy();
   if (!policy.enterpriseMode) return guests;
-  return guests.map((guest) => {
+  const loaded = [];
+  for (const guest of guests) {
+    if (guest.source === 'git' && !isAllowedRepository(guest.gitOrigin?.url, policy.allowedExtensions)) {
+      console.warn(`[guests] Refusing ${guest.id}: origin ${guest.gitOrigin?.url ?? 'unknown'} is not in allowedExtensions`);
+      continue;
+    }
     const blocked = enterpriseBlockedCapabilities(guest, { source: guest.source, gitUrl: guest.gitOrigin?.url }, policy);
-    if (blocked.length === 0) return guest;
-    return {
+    if (blocked.length === 0) {
+      loaded.push(guest);
+      continue;
+    }
+    loaded.push({
       ...guest,
       capabilityGrants: guest.capabilityGrants.filter((capability) => !blocked.includes(capability)),
       enterpriseBlocked: blocked,
-    };
-  });
+    });
+  }
+  return loaded;
 };
 
 export const listInstalledGuests = async ({ persistPath } = {}) => {

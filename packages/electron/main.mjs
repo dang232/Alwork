@@ -1364,11 +1364,6 @@ const spawnLocalServer = async () => {
     homedir: () => os.homedir(),
   });
   process.env.OPENCHAMBER_DESKTOP_NOTIFY = 'true';
-  if (desktopUiPassword) {
-    process.env.OPENCHAMBER_UI_PASSWORD = desktopUiPassword;
-  } else {
-    delete process.env.OPENCHAMBER_UI_PASSWORD;
-  }
   process.env.OPENCHAMBER_SKIP_API_COMPRESSION = process.env.OPENCHAMBER_SKIP_API_COMPRESSION || 'true';
   process.env.NO_PROXY = process.env.NO_PROXY || 'localhost,127.0.0.1';
   process.env.no_proxy = process.env.no_proxy || 'localhost,127.0.0.1';
@@ -1378,7 +1373,6 @@ const spawnLocalServer = async () => {
   const handle = await startWebUiServer({
     port: chosenPort,
     host: bindHost,
-    uiPassword: desktopUiPassword || null,
     attachSignals: false,
     exitOnShutdown: false,
     apiOnly: false,
