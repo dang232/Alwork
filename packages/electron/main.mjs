@@ -219,7 +219,10 @@ const readAppMetadata = () => {
 const APP_METADATA = readAppMetadata();
 const APP_VERSION = APP_METADATA.version;
 
-const DEFAULT_DESKTOP_PORT = 57123;
+// Fixed loopback port for the desktop server: the registered Google callback URL
+// (http://127.0.0.1:57123/auth/desktop-google/callback) depends on it, so there is
+// no fallback. Occupied → loud startup failure in spawnLocalServer.
+const DESKTOP_PORT = 57123;
 const LOOPBACK_BIND_HOST = '127.0.0.1';
 const LAN_BIND_HOST = '0.0.0.0';
 const MINI_CHAT_WINDOW_WIDTH = 520;
@@ -911,19 +914,6 @@ const waitForHealth = async (url, timeoutMs = 20_000, initialPollMs = 250, maxPo
   return false;
 };
 
-const pickUnusedPort = async (host = '127.0.0.1') => {
-  const net = await import('node:net');
-  return await new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.listen(0, host, () => {
-      const address = server.address();
-      const port = typeof address === 'object' && address ? address.port : 0;
-      server.close(() => resolve(port));
-    });
-    server.on('error', reject);
-  });
-};
-
 const isPortFree = async (port, host = '127.0.0.1') => {
   if (!Number.isFinite(port) || port <= 0) return false;
   const net = await import('node:net');
@@ -1309,7 +1299,9 @@ const spawnLocalServer = async () => {
   await inheritUserShellEnv();
 
   const settings = readSettingsRoot();
-  const storedPort = Number.isFinite(settings.desktopLocalPort) ? settings.desktopLocalPort : null;
+  // The desktop Google callback URL is registered once (console) against this port,
+  // against this port, so the local server always binds exactly here: no
+  // stored-port or random-port fallback. A second instance fails loudly below.
   // When the user enables "Desktop Network Access" we bind on all interfaces
   // so phones/tablets on the same Wi-Fi can reach the app. UI shows a clear
   // warning and persists the flag via /api/config/settings.
@@ -1335,18 +1327,14 @@ const spawnLocalServer = async () => {
 
   // Probe before starting the server — main() in the server module sets up a
   // lot of global state before binding, and calling it twice after a listen
-  // failure would double-wire runtimes. Pick a known-free port in one shot.
-  const candidates = [storedPort, DEFAULT_DESKTOP_PORT].filter((v) => Number.isFinite(v) && v > 0);
-  let chosenPort = 0;
-  for (const candidate of candidates) {
-    if (await isPortFree(candidate, bindHost)) {
-      chosenPort = candidate;
-      break;
-    }
+  // failure would double-wire runtimes. The port is fixed (see above), so an
+  // occupied port is a loud startup failure, not a silent re-pick.
+  if (!(await isPortFree(DESKTOP_PORT, bindHost))) {
+    throw new Error(
+      `Desktop server port ${DESKTOP_PORT} is occupied (${bindHost}). Close the other app using it, then start OpenChamber again.`,
+    );
   }
-  if (chosenPort === 0) {
-    chosenPort = await pickUnusedPort(bindHost);
-  }
+  const chosenPort = DESKTOP_PORT;
 
   // The server module reads ENV_DESKTOP_NOTIFY / OPENCHAMBER_DIST_DIR /
   // OPENCHAMBER_RUNTIME at import time (top-level const), so these must be
@@ -4502,9 +4490,11 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
 
     case 'desktop_start_google_login': {
       // Narrow by construction: the only URL this channel ever opens is the
-      // login page our own local server just minted — never renderer input.
-      // The system browser (not an app window) opens it so the user's Google
-      // session and its consent UI behave exactly like the web flow.
+      // Google OAuth authorize URL our own local server just built (loopback
+      // redirect back to this machine, PKCE + state minted server-side) —
+      // never renderer input and never a JavaScript-origin page. The system
+      // browser (not an app window) opens it so the user's Google session
+      // and its consent UI behave exactly like the web flow.
       const localBase = typeof state.sidecarUrl === 'string' ? state.sidecarUrl.trim().replace(/\/$/, '') : '';
       if (!localBase) throw new Error('Local server is not running');
       const startResponse = await fetch(`${localBase}/api/auth/desktop/google/start`, {
@@ -4516,9 +4506,18 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       if (!startResponse.ok) throw new Error(`Google login could not start (status ${startResponse.status})`);
       const payload = await startResponse.json().catch(() => null);
       const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
-      const pageUrl = typeof payload?.pageUrl === 'string' ? payload.pageUrl : '';
-      if (!requestId || !pageUrl) throw new Error('Google login could not start');
-      await shell.openExternal(`${localBase}${pageUrl}`);
+      const googleUrl = typeof payload?.googleUrl === 'string' ? payload.googleUrl : '';
+      if (!requestId || !googleUrl) throw new Error('Google login could not start');
+      let parsedGoogleUrl = null;
+      try {
+        parsedGoogleUrl = new URL(googleUrl);
+      } catch {
+        throw new Error('Google login could not start');
+      }
+      if (parsedGoogleUrl.protocol !== 'https:' || parsedGoogleUrl.hostname !== 'accounts.google.com') {
+        throw new Error('Google login could not start');
+      }
+      await shell.openExternal(parsedGoogleUrl.toString());
       return { requestId };
     }
 
