@@ -80,4 +80,11 @@ unconfirming service fails closed — never a session.
   `http://127.0.0.1:57123/auth/desktop-google/callback` in all modes — the
   request Host never influences it, so the authorize URL always matches the
   registered redirect exactly. The desktop server always binds port 57123
-  and fails loudly at startup when it is occupied.
+  and fails loudly at startup when it is occupied; any other serving layout
+  (dev API/HMR included) binds a dedicated loopback listener on 57123 for
+  the callback alone (`desktop-callback-listener.js`), sharing this
+  module's pending-request map so a login started on any port completes.
+
+- `registerCallbackRoute({ get })`: mounts only
+  `GET /auth/desktop-google/callback` with the same handler and map — the
+  fixed-port listener's entry point. No logic is duplicated there.

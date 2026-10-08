@@ -33,11 +33,12 @@ const GOOGLE_REQUEST_TTL_MS = 5 * 60 * 1000;
 const GOOGLE_CLIENT_CACHE_TTL_MS = 10 * 60 * 1000;
 const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const DESKTOP_GOOGLE_CALLBACK_PATH = '/auth/desktop-google/callback';
-// Fixed loopback port the desktop server always binds (loud startup failure
-// when occupied). Google only redirects to the exact registered URI, so the
-// authorize URL carries this constant in all modes — the serving port never
-// influences it.
-const DESKTOP_PORT = 57123;
+// Fixed loopback port for the desktop Google callback: the registered Google
+// redirect URI depends on it, so there is no fallback. The main server binds
+// it directly when it serves on it (packaged desktop); every other mode
+// serves the same callback through a dedicated listener on this port.
+// Occupied → loud startup failure.
+export const DESKTOP_PORT = 57123;
 const DESKTOP_GOOGLE_REDIRECT_URI = `http://127.0.0.1:${DESKTOP_PORT}${DESKTOP_GOOGLE_CALLBACK_PATH}`;
 const JSON_BODY_LIMIT = '64kb';
 
@@ -379,6 +380,73 @@ ${detailLine}
     };
   };
 
+  // Loopback OAuth callback handler, shared by the main server and the
+  // fixed-port listener: one implementation over one pending-request map.
+  // The dedicated listener mounts only this route through
+  // registerCallbackRoute below — no logic is duplicated there.
+  const handleDesktopGoogleCallback = async (req, res) => {
+    const fail = (status, failure) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(status).send(callbackFailurePage(status, failure));
+    };
+    const parsedQuery = desktopCallbackQuerySchema.safeParse(req?.query ?? {});
+    const state = parsedQuery.success ? parsedQuery.data.state : '';
+    const code = parsedQuery.success && parsedQuery.data.code !== undefined ? parsedQuery.data.code : '';
+    const googleError = parsedQuery.success && parsedQuery.data.error !== undefined ? parsedQuery.data.error : '';
+    if (googleError !== '') {
+      return fail(400, {
+        step: 'google', code: 'google_oauth_error', detail: googleError.slice(0, 64),
+      });
+    }
+    if (!requestIdSchema.safeParse(state).success || code === '' || code.length > 2048) {
+      return fail(400, { step: 'callback', code: 'invalid_request', detail: '' });
+    }
+    sweepGoogle();
+    const pending = pendingGoogle.get(state);
+    if (!pending) {
+      return fail(410, { step: 'callback', code: 'invalid_state', detail: '' });
+    }
+    if (pending.failure !== null && pending.failure !== undefined) {
+      // Repeat navigation after a failed exchange: the same named page.
+      return fail(pending.failure.status, pending.failure);
+    }
+    if (pending.pair !== null) {
+      // Double navigation after a captured code: idempotent success.
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.send(callbackSuccessPage());
+    }
+    let exchange;
+    try {
+      exchange = await callAuthService('/auth/google/desktop-code', {
+        code,
+        redirect_uri: pending.redirectUri,
+        code_verifier: pending.verifier,
+        nonce: pending.nonce,
+      });
+    } catch {
+      pending.failure = { step: 'exchange', code: 'upstream_unavailable', status: 502, detail: '' };
+      return fail(502, pending.failure);
+    }
+    const parsedToken = exchange.status === 200
+      ? servicePairSchema.safeParse(exchange.data)
+      : null;
+    const accessToken = parsedToken && parsedToken.success ? parsedToken.data.access_token.trim() : '';
+    if (accessToken === '') {
+      pending.failure = exchangeFailureOf(exchange);
+      return fail(pending.failure.status, pending.failure);
+    }
+    pending.pair = accessToken;
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(callbackSuccessPage());
+  };
+
+  const registerCallbackRoute = ({ get: getRoute }) => {
+    getRoute(DESKTOP_GOOGLE_CALLBACK_PATH, handleDesktopGoogleCallback);
+  };
+
   const registerRoutes = ({ get, post }, { express, tunnelAuthController }) => {
     const json = express.json({ limit: JSON_BODY_LIMIT });
 
@@ -488,73 +556,7 @@ ${detailLine}
       res.json({ requestId, googleUrl: `${GOOGLE_AUTHORIZE_URL}?${params.toString()}` });
     });
 
-    // Loopback OAuth callback (system-browser navigation, no credentials):
-    // validates the state this server minted, redeems the code at the
-    // service where the secret lives, and holds the pair for the app poll.
-    // Stays public like the page it replaces — the system browser sends no
-    // auth headers, and unknown states fail closed before any exchange.
-    // Exchange failures are RETAINED on the pending entry (never deleted)
-    // with their named step+code: the page names them, a repeat navigation
-    // re-renders the same page, and the app poll reads the failure once
-    // instead of waiting on 404 until the request expires.
-    get('/auth/desktop-google/callback', async (req, res) => {
-      const fail = (status, failure) => {
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(status).send(callbackFailurePage(status, failure));
-      };
-      const parsedQuery = desktopCallbackQuerySchema.safeParse(req?.query ?? {});
-      const state = parsedQuery.success ? parsedQuery.data.state : '';
-      const code = parsedQuery.success && parsedQuery.data.code !== undefined ? parsedQuery.data.code : '';
-      const googleError = parsedQuery.success && parsedQuery.data.error !== undefined ? parsedQuery.data.error : '';
-      if (googleError !== '') {
-        return fail(400, {
-          step: 'google', code: 'google_oauth_error', detail: googleError.slice(0, 64),
-        });
-      }
-      if (!requestIdSchema.safeParse(state).success || code === '' || code.length > 2048) {
-        return fail(400, { step: 'callback', code: 'invalid_request', detail: '' });
-      }
-      sweepGoogle();
-      const pending = pendingGoogle.get(state);
-      if (!pending) {
-        return fail(410, { step: 'callback', code: 'invalid_state', detail: '' });
-      }
-      if (pending.failure !== null && pending.failure !== undefined) {
-        // Repeat navigation after a failed exchange: the same named page.
-        return fail(pending.failure.status, pending.failure);
-      }
-      if (pending.pair !== null) {
-        // Double navigation after a captured code: idempotent success.
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.send(callbackSuccessPage());
-      }
-      let exchange;
-      try {
-        exchange = await callAuthService('/auth/google/desktop-code', {
-          code,
-          redirect_uri: pending.redirectUri,
-          code_verifier: pending.verifier,
-          nonce: pending.nonce,
-        });
-      } catch {
-        pending.failure = { step: 'exchange', code: 'upstream_unavailable', status: 502, detail: '' };
-        return fail(502, pending.failure);
-      }
-      const parsedToken = exchange.status === 200
-        ? servicePairSchema.safeParse(exchange.data)
-        : null;
-      const accessToken = parsedToken && parsedToken.success ? parsedToken.data.access_token.trim() : '';
-      if (accessToken === '') {
-        pending.failure = exchangeFailureOf(exchange);
-        return fail(pending.failure.status, pending.failure);
-      }
-      pending.pair = accessToken;
-      res.setHeader('Cache-Control', 'no-store');
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.send(callbackSuccessPage());
-    });
+    registerCallbackRoute({ get });
 
     post('/api/auth/desktop/google-complete', json, async (req, res) => {
       if (isTunnelScope(tunnelAuthController, req)) return tunnelRefusal(res, 'Google login');
@@ -584,6 +586,9 @@ ${detailLine}
 
   return {
     registerRoutes,
+    // Mounts only GET /auth/desktop-google/callback with the same handler
+    // (and the same pending-request map) for the fixed-port listener.
+    registerCallbackRoute,
     serviceBase,
     // Test seams (not routes).
     _pendingGoogle: pendingGoogle,

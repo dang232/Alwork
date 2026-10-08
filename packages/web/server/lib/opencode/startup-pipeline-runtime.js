@@ -1,3 +1,4 @@
+import { startDesktopCallbackListener as defaultStartDesktopCallbackListener } from '../desktop-auth/desktop-callback-listener.js';
 import { recordStartupPerformance } from './startup-performance.js';
 
 export const createStartupPipelineRuntime = (dependencies) => {
@@ -6,6 +7,7 @@ export const createStartupPipelineRuntime = (dependencies) => {
     createDictationRuntime,
     createMessageStreamWsRuntime,
     createServerStartupRuntime,
+    startDesktopCallbackListener = defaultStartDesktopCallbackListener,
   } = dependencies;
 
   const run = async (options) => {
@@ -60,6 +62,11 @@ export const createStartupPipelineRuntime = (dependencies) => {
       attachSignals,
       apiOnly,
       dictationModelsDir,
+      // The desktop-auth runtime's own callback registrar (shares its
+      // pending-request map with the login start). Required: without it the
+      // fixed-port listener cannot serve, so startup fails loudly below
+      // instead of silently losing Google logins.
+      registerDesktopGoogleCallbackRoute = null,
     } = options;
 
     const terminalRuntime = createTerminalRuntime({
@@ -140,6 +147,18 @@ export const createStartupPipelineRuntime = (dependencies) => {
       durationMs: performance.now() - pipelineStartedAt,
     });
     tunnelRuntimeContext.setActivePort(startupResult.activePort);
+    // Dev layouts serve on dynamic ports, but the registered Google redirect
+    // is fixed: bind the loopback callback listener (skips when the main
+    // server already serves on the fixed port). It closes with the main
+    // server, so embedded restarts never leak it.
+    const desktopCallbackListener = await startDesktopCallbackListener({
+      express,
+      registerCallbackRoute: registerDesktopGoogleCallbackRoute,
+      activePort: startupResult.activePort,
+    });
+    server.once('close', () => {
+      void desktopCallbackListener.stop().catch(() => {});
+    });
     if (onListenerReady) await onListenerReady();
     scheduleOpenCodeApiDetection();
     void bootstrapOpenCodeAtStartup();
@@ -150,6 +169,7 @@ export const createStartupPipelineRuntime = (dependencies) => {
       terminalRuntime,
       dictationRuntime,
       messageStreamRuntime,
+      desktopCallbackListener,
     };
   };
 

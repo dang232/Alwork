@@ -109,7 +109,7 @@ export const createBootstrapRuntime = (dependencies) => {
     });
     notificationEmitRoutes.registerPluginRoute();
 
-    registerAuthAndAccessRoutes(app, {
+    const authAndAccessRoutes = registerAuthAndAccessRoutes(app, {
       express,
       tunnelAuthController,
       uiAuthController,
@@ -180,6 +180,7 @@ export const createBootstrapRuntime = (dependencies) => {
 
     return {
       uiAuthController,
+      desktopAuthRuntime: authAndAccessRoutes?.desktopAuthRuntime ?? null,
     };
   };
 

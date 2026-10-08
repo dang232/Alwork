@@ -679,12 +679,13 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     return uiAuthController.handleSessionCreate(req, res);
   });
 
-  createDesktopAuthRuntime({
+  const desktopAuthRuntime = createDesktopAuthRuntime({
     uiAuthController,
     alcoreSecret,
     alcorePreviousSecret,
     alcoreIssuer,
-  }).registerRoutes({
+  });
+  desktopAuthRuntime.registerRoutes({
     get: (path, ...handlers) => app.get(path, ...handlers),
     post: (path, ...handlers) => app.post(path, ...handlers),
   }, { express, tunnelAuthController });
@@ -1056,6 +1057,8 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
       next(err);
     }
   });
+
+  return { desktopAuthRuntime };
 };
 
 export const registerSettingsUtilityRoutes = (app, dependencies) => {

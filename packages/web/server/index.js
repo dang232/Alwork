@@ -112,6 +112,7 @@ import { createRoutingRuntime } from './lib/routing/runtime.js';
 import { createJevClient } from './lib/routing/jev.js';
 import { createSessionWorkRuntime } from './lib/session-work/runtime.js';
 import { createSessionLineage } from './lib/session-lineage.js';
+import { DESKTOP_CALLBACK_PORT } from './lib/desktop-auth/desktop-callback-listener.js';
 import { createGracefulShutdownRuntime } from './lib/opencode/shutdown-runtime.js';
 import { beginGuestServiceHost, beginGuestServiceShutdown, stopAllGuestServices } from './lib/guests/service.js';
 import { findInstalledGuest } from './lib/guests/catalog.js';
@@ -2466,8 +2467,8 @@ async function main(options = {}) {
     getOpenCodeAuthHeaders,
     getOpenCodePort: () => openCodePort,
     // Dev-server discovery must not offer OpenChamber's own listeners back to
-    // the user as something to preview.
-    getOwnPorts: () => [port, openCodePort].filter((value) => Number.isInteger(value) && value > 0),
+    // the user as something to preview (including the fixed-port callback).
+    getOwnPorts: () => [port, openCodePort, DESKTOP_CALLBACK_PORT].filter((value) => Number.isInteger(value) && value > 0),
     getActivePort: () => {
       const address = server?.address?.();
       return address && Number.isInteger(address.port) ? address.port : null;
@@ -2564,6 +2565,9 @@ async function main(options = {}) {
     attachSignals,
     apiOnly,
     dictationModelsDir: path.join(OPENCHAMBER_USER_CONFIG_ROOT, 'speech-models'),
+    // Shares the desktop-auth runtime's pending-request map with the login
+    // start, so the fixed-port callback completes dev-layout logins.
+    registerDesktopGoogleCallbackRoute: bootstrapResult.desktopAuthRuntime?.registerCallbackRoute ?? null,
   });
   terminalRuntime = startupPipelineResult.terminalRuntime;
   dictationRuntime = startupPipelineResult.dictationRuntime;

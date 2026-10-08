@@ -17,6 +17,10 @@ describe('startup pipeline runtime', () => {
         },
         attachProcessHandlers: vi.fn(),
       }),
+      startDesktopCallbackListener: async () => {
+        order.push('callback');
+        return { skipped: false, server: null, port: 57123, stop: async () => {} };
+      },
     });
 
     await runtime.run({
@@ -31,10 +35,11 @@ describe('startup pipeline runtime', () => {
       bootstrapOpenCodeAtStartup: () => order.push('bootstrap'),
       process: {},
       crypto: {},
-      server: {},
+      server: { once: vi.fn() },
+      registerDesktopGoogleCallbackRoute: vi.fn(),
       attachSignals: false,
     });
 
-    expect(order).toEqual(['listen', 'port:3901', 'detect', 'bootstrap']);
+    expect(order).toEqual(['listen', 'port:3901', 'callback', 'detect', 'bootstrap']);
   });
 });
