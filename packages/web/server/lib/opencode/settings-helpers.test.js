@@ -460,15 +460,11 @@ describe('settings helpers', () => {
     expect(helpers.sanitizeSettingsUpdate({ permissionDefaultMode: 'always' })).toEqual({});
   });
 
-  it('accepts desktopUiPassword as a persisted shared setting', () => {
+  it('drops the removed desktopUiPassword setting', () => {
     const helpers = createTestHelpers();
 
-    expect(helpers.sanitizeSettingsUpdate({ desktopUiPassword: ' secret ' })).toEqual({
-      desktopUiPassword: 'secret',
-    });
-    expect(helpers.sanitizeSettingsUpdate({ desktopUiPassword: '' })).toEqual({
-      desktopUiPassword: '',
-    });
+    expect(helpers.sanitizeSettingsUpdate({ desktopUiPassword: ' secret ' })).toEqual({});
+    expect(helpers.sanitizeSettingsUpdate({ desktopUiPassword: '' })).toEqual({});
   });
 
   it('accepts mobileKeyboardMode as a persisted shared setting', () => {
@@ -603,11 +599,11 @@ describe('settings helpers', () => {
     try {
       process.env.OPENCHAMBER_RUNTIME = 'desktop';
       process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_ACTIVE = 'false';
-      process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'missing-password';
+      process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'missing-alcore-secret';
 
       const response = helpers.formatSettingsResponse({ desktopLanAccessEnabled: true });
       expect(response.desktopLanAccessActive).toBe(false);
-      expect(response.desktopLanAccessBlockedReason).toBe('missing-password');
+      expect(response.desktopLanAccessBlockedReason).toBe('missing-alcore-secret');
     } finally {
       if (typeof previousRuntime === 'string') process.env.OPENCHAMBER_RUNTIME = previousRuntime;
       else delete process.env.OPENCHAMBER_RUNTIME;
@@ -814,7 +810,7 @@ describe('settings registry gate', () => {
     projects: [{ id: 'p', path: '/home/testuser/project' }], activeProjectId: 'p',
     securityScopedBookmarks: ['bookmark'], pinnedDirectories: ['/home/testuser/project'],
     desktopLanAccessEnabled: true, desktopKeepAwakeEnabled: true, desktopMinimizeToTrayEnabled: true, desktopMacMenuBarEnabled: true, desktopLinuxNativeFrame: true, sidebarShowChatsSection: false,
-    desktopUiPassword: 'secret', githubClientId: 'client', githubScopes: 'repo', gitlabClientId: 'gitlab-client', skillCatalogs: [{ id: 'c', label: 'C', source: 'https://x' }],
+    githubClientId: 'client', githubScopes: 'repo', gitlabClientId: 'gitlab-client', skillCatalogs: [{ id: 'c', label: 'C', source: 'https://x' }],
     defaultGitIdentityId: 'global', permissionAutoAccept: { sessions: { s: true }, revision: 1 }, permissionDefaultMode: 'safety', messageSearchEnabled: true, messageSearchReasoningEnabled: true,
     agentControlToolEnabled: true, agentWebToolEnabled: true, browserProvider: 'builtin', agentMemoryToolEnabled: true, agentNotifyToolEnabled: true, agentToolsCodeMode: true, isolatedSpacesEnabled: true, isolatedSpacesIdleStop: { enabled: true, hours: 4 }, openCodeUpdateToastDismissedVersion: '1.0.0',
     autoDeleteEnabled: true, autoDeleteAfterDays: 30, sessionRetentionOnlyArchived: false, sessionRetentionAction: 'archive', mergedWorktreeCleanupEnabled: true, terminalShell: 'zsh', terminalLoginShells: ['zsh'],
@@ -904,11 +900,9 @@ describe('settings registry gate', () => {
     const helpers = createTestHelpers();
     const secretKeys = Object.entries(registry.fields).filter(([, field]) => field.secret).map(([key]) => key);
     expect(secretKeys).toContain('managedRemoteTunnelToken');
-    expect(secretKeys).toContain('desktopUiPassword');
     expect(secretKeys).toContain('managedRemoteTunnelPresetTokens');
     const response = helpers.formatSettingsResponse({
       managedRemoteTunnelToken: 'token',
-      desktopUiPassword: 'pw',
       managedRemoteTunnelPresetTokens: { a: 'tok' },
       themeId: 'x',
     });
@@ -916,8 +910,6 @@ describe('settings registry gate', () => {
       expect(response).not.toHaveProperty(key);
     }
     expect(response.hasManagedRemoteTunnelToken).toBe(true);
-    expect(response.hasDesktopUiPassword).toBe(true);
-    expect(helpers.formatSettingsResponse({ desktopUiPassword: '' }).hasDesktopUiPassword).toBe(false);
   });
 
   it('accepts the newly shared profile fields', () => {

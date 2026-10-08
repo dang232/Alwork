@@ -375,7 +375,7 @@ printf '4321\\n'`);
     }
   });
 
-  test('stores a client token for forwarded OpenChamber hosts when a UI secret is configured', async () => {
+  test('stores a client token for forwarded OpenChamber hosts when an Alcore secret is configured', async () => {
     let loginPayload = null;
     const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && req.url === '/auth/session') {
@@ -396,12 +396,12 @@ printf '4321\\n'`);
       emit: () => undefined,
     });
 
-    const token = await manager.issueClientToken(localUrl, 'ui-secret');
+    const token = await manager.issueClientToken(localUrl, 'alcore-secret');
     await manager.updateHostRuntime('ssh-1', 'SSH Host', localUrl, token);
 
     const settings = JSON.parse(fs.readFileSync(settingsFilePath, 'utf8'));
     expect(loginPayload).toMatchObject({
-      alcoreToken: 'ui-secret',
+      alcoreToken: 'alcore-secret',
       trustDevice: true,
       issueClientToken: true,
     });
@@ -600,7 +600,7 @@ printf '4321\\n'`);
 
     expect(scripts).toEqual(["'/home/pi/.bun/bin/openchamber' stop --port 41777"]);
   });
-  test('publishes the remote server to its network only with its UI secret', async () => {
+  test('publishes the remote server to its network only with its Alcore secret', async () => {
     const manager = new ElectronSshManager({
       settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
       appVersion: '1.2.3',
@@ -621,14 +621,25 @@ printf '4321\\n'`);
     };
 
     await expect(manager.startRemoteServerManaged(parsed, '/tmp/control.sock', exposed, 4321, '/bin/openchamber'))
-      .rejects.toThrow(/requires its UI secret/);
+      .rejects.toThrow(/requires its Alcore secret/);
 
     const secured = {
       ...exposed,
-      auth: { openchamberPassword: { enabled: true, value: 'remote-secret', store: 'settings' } },
+      auth: { alcoreSecret: { enabled: true, value: 'remote-secret', store: 'settings' } },
     };
     await manager.startRemoteServerManaged(parsed, '/tmp/control.sock', secured, 4321, '/bin/openchamber');
     expect(started).toContain('--hostname 0.0.0.0');
+  });
+
+  test('reads the pre-Alcore stored host secret for existing hosts', async () => {
+    const manager = new ElectronSshManager({
+      settingsFilePath: path.join(os.tmpdir(), 'unused-settings.json'),
+      appVersion: '1.2.3',
+      emit: () => undefined,
+    });
+    expect(manager.configuredAlcoreSecret({ auth: { openchamberPassword: { enabled: true, value: 'legacy-secret', store: 'settings' } } })).toBe('legacy-secret');
+    expect(manager.configuredAlcoreSecret({ auth: { alcoreSecret: { enabled: true, value: 'new-secret', store: 'settings' }, openchamberPassword: { enabled: true, value: 'legacy-secret', store: 'settings' } } })).toBe('new-secret');
+    expect(manager.configuredAlcoreSecret({ auth: {} })).toBeNull();
   });
 
   describe('managed server reuse', () => {
@@ -724,7 +735,7 @@ printf '4321\\n'`);
       const { host, manager } = createRemoteHost([{ port: 30001, version: '1.2.3', bindHost: '127.0.0.1', password: 'remote-secret' }]);
       const exposed = {
         ...managed({ bindHost: '0.0.0.0' }),
-        auth: { openchamberPassword: { enabled: true, value: 'remote-secret', store: 'settings' } },
+        auth: { alcoreSecret: { enabled: true, value: 'remote-secret', store: 'settings' } },
       };
 
       await manager.ensureRemoteServer(exposed, parsed, '/unused.sock');
@@ -735,7 +746,7 @@ printf '4321\\n'`);
 
     const withSecret = (value, remoteOpenchamber) => ({
       ...managed(remoteOpenchamber),
-      auth: { openchamberPassword: { enabled: true, value, store: 'settings' } },
+      auth: { alcoreSecret: { enabled: true, value, store: 'settings' } },
     });
 
     test('neither reuses nor stops a server that rejects the instance secret', async () => {
@@ -805,7 +816,7 @@ printf '4321\\n'`);
       await manager.ensureRemoteServer(withSecret('remote-secret'), parsed, '/unused.sock');
 
       expect(host.stopped).toEqual([]);
-      expect(manager.logsForInstance('ssh-reuse', 50).join('\n')).toContain('remote port 30001: it does not take this instance\'s UI secret (auth status 429)');
+      expect(manager.logsForInstance('ssh-reuse', 50).join('\n')).toContain('remote port 30001: it does not take this instance\'s Alcore secret (auth status 429)');
     });
 
     test('disconnecting with keepRunning off stops an adopted daemon', async () => {

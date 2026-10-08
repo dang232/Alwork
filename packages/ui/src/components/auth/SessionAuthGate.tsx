@@ -119,7 +119,7 @@ const readStoredTrustDevice = (): boolean => {
   return window.localStorage.getItem(TRUST_DEVICE_STORAGE_KEY) === 'true';
 };
 
-const submitPassword = async (password: string, trustDevice: boolean): Promise<Response> => {
+const submitAlcoreToken = async (alcoreToken: string, trustDevice: boolean): Promise<Response> => {
   const issueClientToken = shouldIssueDesktopClientToken();
   const response = await runtimeFetch(STATUS_CHECK_ENDPOINT, {
     method: 'POST',
@@ -129,7 +129,7 @@ const submitPassword = async (password: string, trustDevice: boolean): Promise<R
       Accept: 'application/json',
     },
     body: JSON.stringify({
-      password,
+      alcoreToken,
       trustDevice,
       issueClientToken,
       clientLabel: 'OpenChamber Desktop',
@@ -161,7 +161,7 @@ const issueDesktopClientToken = async (): Promise<string> => {
   return typeof payload?.token === 'string' ? payload.token.trim() : '';
 };
 
-const shouldUseDesktopShellPasswordLogin = (): boolean => {
+const shouldUseDesktopShellAlcoreLogin = (): boolean => {
   return isDesktopShell() && !isLocalDesktopRuntime();
 };
 
@@ -174,23 +174,23 @@ const isRuntimeIdentityActive = (identity: RuntimeIdentity): boolean => {
   return runtimeIdentityMatches(identity, captureRuntimeIdentity());
 };
 
-type DesktopPasswordLoginResult = {
+type DesktopAlcoreLoginResult = {
   token: string;
   status?: number;
 };
 
 const issueDesktopClientTokenViaShell = async (
-  password: string,
+  alcoreToken: string,
   trustDevice: boolean,
   runtime: RuntimeIdentity,
   requestHeaders: Record<string, string>,
-): Promise<DesktopPasswordLoginResult | null> => {
+): Promise<DesktopAlcoreLoginResult | null> => {
   if (!isDesktopShell() || typeof window === 'undefined') {
     return null;
   }
-  const response = await invokeDesktop('desktop_remote_password_login', {
+  const response = await invokeDesktop('desktop_remote_alcore_login', {
     url: runtime.apiBaseUrl,
-    password,
+    alcoreToken,
     trustDevice,
     requestHeaders,
   }).catch(() => null);
@@ -344,7 +344,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
   const skipAuth = vscodeRuntime;
   const showHostSwitcher = React.useMemo(() => isDesktopShell() && !vscodeRuntime, [vscodeRuntime]);
   const [state, setState] = React.useState<GateState>(() => (skipAuth ? 'authenticated' : 'pending'));
-  const [password, setPassword] = React.useState('');
+  const [alcoreToken, setAlcoreToken] = React.useState('');
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState('');
   const [retryAfter, setRetryAfter] = React.useState<number | undefined>(undefined);
@@ -354,12 +354,12 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
   const [isPasskeyBusy, setIsPasskeyBusy] = React.useState(false);
   const [trustDevice, setTrustDevice] = React.useState<boolean>(() => readStoredTrustDevice());
   const [activePasskeyAction, setActivePasskeyAction] = React.useState<'auth' | 'register' | null>(null);
-  const passwordInputRef = React.useRef<HTMLInputElement | null>(null);
+  const tokenInputRef = React.useRef<HTMLInputElement | null>(null);
   const hasResyncedRef = React.useRef(skipAuth);
   const hasBootstrapResyncedRef = React.useRef(skipAuth);
   // Whether the home directory was resolved after authentication. Until then
   // the app stays unmounted when the home is unknown: on a first visit to a
-  // password-protected server the page-load attempt could only fall back to
+  // auth-protected server the page-load attempt could only fall back to
   // "/", and the app would start working there.
   const [homeChecked, setHomeChecked] = React.useState(skipAuth);
 
@@ -526,7 +526,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
       // Network-level failure — over the relay this is typically the initial
       // tunnel attempt racing this request; it self-heals within seconds.
       // No server answer exists here (the request never reached the wire),
-      // so this is never evidence of a password requirement; 401 above is.
+      // so this is never evidence of a lock; only a 401 above is.
       if (scheduleTransientRetry()) return;
       setState('error');
       setIsTunnelLocked(false);
@@ -551,7 +551,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
 
     return subscribeRuntimeEndpointChanged(() => {
       cancelPasskeyCeremony();
-      setPassword('');
+      setAlcoreToken('');
       setErrorMessage('');
       setRetryAfter(undefined);
       setIsTunnelLocked(false);
@@ -609,9 +609,9 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
   }, [skipAuth, state]);
 
   React.useEffect(() => {
-    if (state === 'locked' && passwordInputRef.current) {
-      passwordInputRef.current.focus();
-      passwordInputRef.current.select();
+    if (state === 'locked' && tokenInputRef.current) {
+      tokenInputRef.current.focus();
+      tokenInputRef.current.select();
     }
   }, [state]);
 
@@ -639,7 +639,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    await handlePasswordUnlock(false);
+    await handleAlcoreLogin(false);
   };
 
   const registerPasskeyForCurrentSession = React.useCallback(async () => {
@@ -664,11 +664,11 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     setIsPasskeyBusy(false);
   }, []);
 
-  const handlePasswordUnlock = React.useCallback(async (enrollPasskey: boolean) => {
+  const handleAlcoreLogin = React.useCallback(async (enrollPasskey: boolean) => {
     if (isTunnelLocked) {
       return;
     }
-    if (!password || isSubmitting) {
+    if (!alcoreToken || isSubmitting) {
       return;
     }
 
@@ -682,18 +682,18 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     setErrorMessage('');
 
     try {
-      if (shouldUseDesktopShellPasswordLogin()) {
-        const shellLogin = await issueDesktopClientTokenViaShell(password, trustDevice, runtime, requestHeaders);
+      if (shouldUseDesktopShellAlcoreLogin()) {
+        const shellLogin = await issueDesktopClientTokenViaShell(alcoreToken, trustDevice, runtime, requestHeaders);
         if (!isRuntimeIdentityActive(runtime)) return;
         if (shellLogin?.token) {
-          setPassword('');
+          setAlcoreToken('');
           setIsTunnelLocked(false);
           if (!await applyDesktopClientToken(shellLogin.token, runtime, requestHeaders)) return;
           setState('authenticated');
           return;
         }
         if (shellLogin?.status === 401) {
-          setErrorMessage(t('sessionAuth.error.incorrectPassword'));
+          setErrorMessage(t('sessionAuth.error.invalidAlcoreToken'));
           setIsTunnelLocked(false);
           setState('locked');
           return;
@@ -706,7 +706,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
         }
       }
 
-      const response = await submitPassword(password, trustDevice);
+      const response = await submitAlcoreToken(alcoreToken, trustDevice);
       if (!isRuntimeIdentityActive(runtime)) return;
       if (response.ok) {
         const payload = await response.json().catch(() => null) as { clientToken?: unknown } | null;
@@ -718,13 +718,13 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
             ? payload.clientToken.trim()
             : '';
           if (!clientToken) {
-            const shellLogin = await issueDesktopClientTokenViaShell(password, trustDevice, runtime, requestHeaders);
+            const shellLogin = await issueDesktopClientTokenViaShell(alcoreToken, trustDevice, runtime, requestHeaders);
             if (!isRuntimeIdentityActive(runtime)) return;
             clientToken = shellLogin?.token || await issueDesktopClientToken();
             if (!isRuntimeIdentityActive(runtime)) return;
           }
         }
-        setPassword('');
+        setAlcoreToken('');
         setIsTunnelLocked(false);
         if (clientToken) {
           if (!await applyDesktopClientToken(clientToken, runtime, requestHeaders)) return;
@@ -752,7 +752,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
       }
 
       if (response.status === 401) {
-        setErrorMessage(t('sessionAuth.error.incorrectPassword'));
+        setErrorMessage(t('sessionAuth.error.invalidAlcoreToken'));
         setIsTunnelLocked(false);
         setState('locked');
         return;
@@ -771,20 +771,20 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
       setState('error');
     } catch (error) {
       if (!isRuntimeIdentityActive(runtime)) return;
-      console.warn('Failed to submit UI password:', error);
-      const shellLogin = shouldUseDesktopShellPasswordLogin()
-        ? await issueDesktopClientTokenViaShell(password, trustDevice, runtime, requestHeaders)
+      console.warn('Failed to submit Alcore token:', error);
+      const shellLogin = shouldUseDesktopShellAlcoreLogin()
+        ? await issueDesktopClientTokenViaShell(alcoreToken, trustDevice, runtime, requestHeaders)
         : null;
       if (!isRuntimeIdentityActive(runtime)) return;
       if (shellLogin?.token) {
-        setPassword('');
+        setAlcoreToken('');
         setIsTunnelLocked(false);
         if (!await applyDesktopClientToken(shellLogin.token, runtime, requestHeaders)) return;
         setState('authenticated');
         return;
       }
       if (shellLogin?.status === 401) {
-        setErrorMessage(t('sessionAuth.error.incorrectPassword'));
+        setErrorMessage(t('sessionAuth.error.invalidAlcoreToken'));
         setIsTunnelLocked(false);
         setState('locked');
         return;
@@ -803,9 +803,9 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
         setIsSubmitting(false);
       }
     }
-  }, [cancelActivePasskey, isPasskeyBusy, isSubmitting, isTunnelLocked, password, registerPasskeyForCurrentSession, supportsPasskeys, t, trustDevice]);
+  }, [cancelActivePasskey, isPasskeyBusy, isSubmitting, isTunnelLocked, alcoreToken, registerPasskeyForCurrentSession, supportsPasskeys, t, trustDevice]);
 
-  const handlePasskeyUnlock = React.useCallback(async () => {
+  const handlePasskeySignIn = React.useCallback(async () => {
     if (isSubmitting || !supportsPasskeys) {
       return;
     }
@@ -835,7 +835,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
         if (!await applyDesktopClientToken(clientToken, runtime, requestHeaders)) return;
       }
 
-      setPassword('');
+      setAlcoreToken('');
       setState('authenticated');
     } catch (error) {
       if (!isRuntimeIdentityActive(runtime)) return;
@@ -864,11 +864,11 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
     }
 
     if (state !== 'authenticated') {
-      if (!password) {
-        setErrorMessage(t('sessionAuth.error.enterPasswordForPasskey'));
+      if (!alcoreToken) {
+        setErrorMessage(t('sessionAuth.error.enterTokenForPasskey'));
         return;
       }
-      await handlePasswordUnlock(true);
+      await handleAlcoreLogin(true);
       return;
     }
 
@@ -884,7 +884,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
       const message = error instanceof Error ? error.message : t('sessionAuth.error.passkeySetupFailed');
       toast.error(message);
     }
-  }, [cancelActivePasskey, handlePasswordUnlock, isPasskeyBusy, isSubmitting, isTunnelLocked, password, registerPasskeyForCurrentSession, state, supportsPasskeys, t]);
+  }, [cancelActivePasskey, handleAlcoreLogin, isPasskeyBusy, isSubmitting, isTunnelLocked, alcoreToken, registerPasskeyForCurrentSession, state, supportsPasskeys, t]);
 
   const canOfferPasskeySetup = supportsPasskeys && passkeyStatus.enabled;
   const canUsePasskey = canOfferPasskeySetup && passkeyStatus.hasPasskeys;
@@ -918,12 +918,12 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
         <div className="flex flex-col items-center gap-6 w-full max-w-xs">
           <div className="flex flex-col items-center gap-1 text-center">
             <h1 className="text-xl font-semibold text-foreground">
-              {isTunnelLocked ? t('sessionAuth.locked.tunnelTitle') : t('sessionAuth.locked.unlockTitle')}
+              {isTunnelLocked ? t('sessionAuth.locked.tunnelTitle') : t('sessionAuth.locked.alcoreTitle')}
             </h1>
             <p className="typography-meta text-muted-foreground">
               {isTunnelLocked
                 ? t('sessionAuth.locked.tunnelDescription')
-                : t('sessionAuth.locked.passwordDescription')}
+                : t('sessionAuth.locked.alcoreDescription')}
             </p>
           </div>
 
@@ -934,7 +934,7 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
                   type="button"
                   variant="outline"
                   className="w-full"
-                  onClick={() => void handlePasskeyUnlock()}
+                  onClick={() => void handlePasskeySignIn()}
                   disabled={isSubmitting || (isPasskeyBusy && activePasskeyAction !== 'auth')}
                 >
                   {isPasskeyBusy ? (
@@ -951,14 +951,14 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
                 <div className="relative flex-1">
                   <Icon name="lock" className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/60" />
                   <Input
-                    id="openchamber-ui-password"
-                    ref={passwordInputRef}
+                    id="openchamber-alcore-token"
+                    ref={tokenInputRef}
                     type="password"
-                    autoComplete="current-password"
-                    placeholder={t('sessionAuth.password.placeholder')}
-                    value={password}
+                    autoComplete="off"
+                    placeholder={t('sessionAuth.alcoreToken.placeholder')}
+                    value={alcoreToken}
                     onChange={(event) => {
-                      setPassword(event.target.value);
+                      setAlcoreToken(event.target.value);
                       if (errorMessage) {
                         setErrorMessage('');
                       }
@@ -972,8 +972,8 @@ export const SessionAuthGate: React.FC<SessionAuthGateProps> = ({
                 <Button
                   type="submit"
                   size="icon"
-                  disabled={!password || isSubmitting}
-                  aria-label={isSubmitting ? t('sessionAuth.actions.unlockingAria') : t('sessionAuth.actions.unlockAria')}
+                  disabled={!alcoreToken || isSubmitting}
+                  aria-label={isSubmitting ? t('sessionAuth.actions.signingInAria') : t('sessionAuth.actions.signInAria')}
                 >
                   {isSubmitting ? (
                     <Icon name="loader-4" className="h-4 w-4 animate-spin" />

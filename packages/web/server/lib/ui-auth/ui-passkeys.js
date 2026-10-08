@@ -213,7 +213,7 @@ export const createUiPasskeys = ({
 
   const assertEnabled = () => {
     if (!passwordBinding) {
-      const error = new Error('Passkeys require UI password protection to be enabled');
+      const error = new Error('Passkeys require Alcore login to be enabled');
       error.statusCode = 400;
       throw error;
     }

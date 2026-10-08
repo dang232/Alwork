@@ -55,7 +55,8 @@ export type DesktopSshInstance = {
   };
   auth: {
     sshPassword?: DesktopSshStoredSecret;
-    openchamberPassword?: DesktopSshStoredSecret;
+    /** Per-host Alcore secret, provisioned as the managed remote server's Alcore secret. */
+    alcoreSecret?: DesktopSshStoredSecret;
   };
   portForwards: DesktopSshPortForward[];
 };
@@ -228,7 +229,9 @@ const parseInstance = (value: unknown): DesktopSshInstance | null => {
   const preferredLocalPort =
     readNumber(localRaw, 'preferredLocalPort') ?? readNumber(localRaw, 'preferred_local_port');
   const sshPassword = parseStoredSecret(authRaw.sshPassword || authRaw.ssh_password);
-  const openchamberPassword = parseStoredSecret(authRaw.openchamberPassword || authRaw.openchamber_password);
+  // Legacy `openchamberPassword`/`openchamber_password` (pre-Alcore names for
+  // the same per-host secret) still load existing stored hosts.
+  const alcoreSecret = parseStoredSecret(authRaw.alcoreSecret ?? authRaw.alcore_secret ?? authRaw.openchamberPassword ?? authRaw.openchamber_password);
 
   return {
     id,
@@ -256,7 +259,7 @@ const parseInstance = (value: unknown): DesktopSshInstance | null => {
     },
     auth: {
       ...(sshPassword ? { sshPassword } : {}),
-      ...(openchamberPassword ? { openchamberPassword } : {}),
+      ...(alcoreSecret ? { alcoreSecret } : {}),
     },
     portForwards,
   };

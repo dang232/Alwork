@@ -1,7 +1,6 @@
 import * as React from 'react';
 
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import {
   getDesktopLanAddress,
   getDesktopKeepAwake,
@@ -25,7 +24,6 @@ import {
   SettingsCheckboxRow,
   SETTINGS_OPTION_STACK_CLASS,
   SettingsFieldRow,
-  SettingsStackedField,
 } from '@/components/sections/shared/SettingsSection';
 import { useEnterprisePolicyStore } from '@/stores/useEnterprisePolicyStore';
 import { useUIStore } from '@/stores/useUIStore';
@@ -43,11 +41,6 @@ export const DesktopNetworkSettings: React.FC = () => {
     && window.__OPENCHAMBER_PLATFORM__ === 'linux';
   const [savedValue, setSavedValue] = React.useState(false);
   const [draftValue, setDraftValue] = React.useState(false);
-  // The password is write-only: the server says whether one is set, and the
-  // page sends a value only when the user types a new one or removes it.
-  const [hasSavedPassword, setHasSavedPassword] = React.useState(false);
-  const [draftPassword, setDraftPassword] = React.useState('');
-  const [removePassword, setRemovePassword] = React.useState(false);
   const [lanAccessActive, setLanAccessActive] = React.useState(false);
   const [lanAccessBlockedReason, setLanAccessBlockedReason] = React.useState<string | null>(null);
   const [isLoading, setIsLoading] = React.useState(true);
@@ -99,9 +92,6 @@ export const DesktopNetworkSettings: React.FC = () => {
         const enabled = data.desktopLanAccessEnabled === true;
         setSavedValue(enabled);
         setDraftValue(enabled);
-        setHasSavedPassword(data.hasDesktopUiPassword === true);
-        setDraftPassword('');
-        setRemovePassword(false);
         setLanAccessActive(data.desktopLanAccessActive === true);
         setLanAccessBlockedReason(data.desktopLanAccessBlockedReason ?? null);
         const macMenuBarEnabled = data.desktopMacMenuBarEnabled !== false;
@@ -232,10 +222,7 @@ export const DesktopNetworkSettings: React.FC = () => {
     };
   }, [draftValue, isLocalDesktop]);
 
-  const nextPassword = draftPassword.trim();
-  const passwordDirty = nextPassword.length > 0 || removePassword;
   const isDirty = draftValue !== savedValue
-    || passwordDirty
     || draftMacMenuBarEnabled !== savedMacMenuBarEnabled
     || draftLinuxNativeFrame !== savedLinuxNativeFrame;
   const currentPort = React.useMemo(() => {
@@ -254,27 +241,12 @@ export const DesktopNetworkSettings: React.FC = () => {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   }, []);
   const lanUrl = draftValue && lanAccessActive && lanAddress && currentPort ? `http://${lanAddress}:${currentPort}` : null;
-  const passwordWillBeSet = nextPassword.length > 0 || (hasSavedPassword && !removePassword);
-  const lanRequiresPassword = draftValue && !passwordWillBeSet;
-  const lanBlockedByMissingPassword = savedValue && !lanAccessActive && lanAccessBlockedReason === 'missing-password';
+  const lanBlockedByMissingAlcoreSecret = savedValue && !lanAccessActive && lanAccessBlockedReason === 'missing-alcore-secret';
   // Enterprise mode without the administrator's allowance: the desktop binds
   // loopback and the server refuses a network address, so there is no choice here.
   const lanBlockedByEnterprise = useEnterprisePolicyStore((state) => state.networkAccessBlocked)
     || lanAccessBlockedReason === 'enterprise-mode';
-  const saveDisabled = isLoading || isSaving || !isDirty || lanRequiresPassword;
-
-  const handlePasswordChange = React.useCallback((value: string) => {
-    setDraftPassword(value);
-    if (value.trim()) {
-      setRemovePassword(false);
-    }
-  }, []);
-
-  const handleRemovePassword = React.useCallback(() => {
-    setDraftPassword('');
-    setRemovePassword(true);
-    setDraftValue(false);
-  }, []);
+  const saveDisabled = isLoading || isSaving || !isDirty;
 
   const handleLaunchAtLoginToggle = React.useCallback(async () => {
     if (!launchAtLoginSupported || isSavingLaunchAtLogin) {
@@ -408,8 +380,6 @@ export const DesktopNetworkSettings: React.FC = () => {
     try {
       const result = await updateDesktopSettings({
         desktopLanAccessEnabled: draftValue,
-        // Omitted when unchanged: the server keeps the password it has.
-        ...(nextPassword ? { desktopUiPassword: nextPassword } : removePassword ? { desktopUiPassword: '' } : {}),
         desktopMacMenuBarEnabled: draftMacMenuBarEnabled,
         desktopLinuxNativeFrame: draftLinuxNativeFrame,
       });
@@ -419,13 +389,6 @@ export const DesktopNetworkSettings: React.FC = () => {
       }
 
       setSavedValue(draftValue);
-      if (nextPassword) {
-        setHasSavedPassword(true);
-      } else if (removePassword) {
-        setHasSavedPassword(false);
-      }
-      setDraftPassword('');
-      setRemovePassword(false);
       setSavedMacMenuBarEnabled(draftMacMenuBarEnabled);
       setSavedLinuxNativeFrame(draftLinuxNativeFrame);
 
@@ -437,7 +400,7 @@ export const DesktopNetworkSettings: React.FC = () => {
       setError(cause instanceof Error ? cause.message : t('settings.openchamber.desktopNetwork.error.saveFailed'));
       setIsSaving(false);
     }
-  }, [draftLinuxNativeFrame, draftMacMenuBarEnabled, draftValue, isDirty, nextPassword, removePassword, t]);
+  }, [draftLinuxNativeFrame, draftMacMenuBarEnabled, draftValue, isDirty, t]);
 
   if (!isLocalDesktop) {
     return null;
@@ -560,42 +523,6 @@ export const DesktopNetworkSettings: React.FC = () => {
           </div>
         ) : null}
 
-        <SettingsStackedField
-          settingsItem="sessions.desktop-ui-password"
-          label={(
-            <label htmlFor="desktop-ui-password">
-              {t('settings.openchamber.desktopPassword.field.password')}
-            </label>
-          )}
-          info={t('settings.openchamber.desktopPassword.field.passwordDescription')}
-        >
-          <Input
-            id="desktop-ui-password"
-            type="password"
-            className="h-8 min-w-0 flex-1"
-            value={draftPassword}
-            onChange={(event) => handlePasswordChange(event.target.value)}
-            placeholder={t(hasSavedPassword && !removePassword
-              ? 'settings.openchamber.desktopPassword.field.passwordSetPlaceholder'
-              : 'settings.openchamber.desktopPassword.field.passwordPlaceholder')}
-            disabled={isLoading || isSaving}
-            required={draftValue && !passwordWillBeSet}
-            aria-invalid={lanRequiresPassword}
-          />
-          {hasSavedPassword && !removePassword ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              onClick={handleRemovePassword}
-              disabled={isLoading || isSaving}
-              className="shrink-0 !font-normal"
-            >
-              {t('settings.openchamber.desktopPassword.actions.removePassword')}
-            </Button>
-          ) : null}
-        </SettingsStackedField>
-
         <div className={SETTINGS_OPTION_STACK_CLASS}>
           <SettingsCheckboxRow
             settingsItem="sessions.desktop-lan-access"
@@ -611,9 +538,9 @@ export const DesktopNetworkSettings: React.FC = () => {
                 <span className="block text-[var(--status-warning)]/85">
                   {t('settings.openchamber.desktopNetwork.field.warning')}
                 </span>
-                {lanRequiresPassword || lanBlockedByMissingPassword ? (
+                {lanBlockedByMissingAlcoreSecret ? (
                   <span className="block text-[var(--status-warning)]/85">
-                    {t('settings.openchamber.desktopNetwork.field.passwordRequiredWarning')}
+                    {t('settings.openchamber.desktopNetwork.field.alcoreSecretRequiredWarning')}
                   </span>
                 ) : null}
               </>

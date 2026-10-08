@@ -644,14 +644,6 @@ const SETTINGS_SEARCH_ITEMS: readonly SettingsSearchItem[] = [
     isAvailable: (ctx) => ctx.isDesktopLocalOrigin,
   },
   {
-    id: 'sessions.desktop-ui-password',
-    page: 'general',
-    titleKey: 'settings.openchamber.desktopPassword.field.password',
-    descriptionKey: 'settings.openchamber.desktopPassword.field.passwordDescription',
-    keywords: ['desktop', 'password', 'auth', 'login'],
-    isAvailable: (ctx) => ctx.isDesktopLocalOrigin,
-  },
-  {
     id: 'sessions.desktop-lan-access',
     page: 'general',
     titleKey: 'settings.openchamber.desktopNetwork.field.allowLanAccess',

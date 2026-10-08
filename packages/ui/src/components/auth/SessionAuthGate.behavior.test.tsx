@@ -415,10 +415,10 @@ describe('SessionAuthGate status-check failure behavior', () => {
     const text = collectText(tree);
 
     expect(text).toContain('sessionAuth.error.networkTitle');
-    expect(text).not.toContain('sessionAuth.locked.unlockTitle');
+    expect(text).not.toContain('sessionAuth.locked.alcoreTitle');
   });
 
-  test('keeps desktop-shell status-check rejection on the error screen, never a guessed password prompt', async () => {
+  test('keeps desktop-shell status-check rejection on the error screen, never a guessed Alcore login prompt', async () => {
     resetHarness();
     desktopShell = true;
     runtimeFetchRejects = true;
@@ -427,7 +427,7 @@ describe('SessionAuthGate status-check failure behavior', () => {
     const text = collectText(tree);
 
     expect(text).toContain('sessionAuth.error.networkTitle');
-    expect(text).not.toContain('sessionAuth.locked.unlockTitle');
+    expect(text).not.toContain('sessionAuth.locked.alcoreTitle');
     // A network failure says nothing about the server, so the desktop error
     // screen keeps its real escape hatches: retry and the host switcher.
     expect(text).toContain('host-switcher');
@@ -451,7 +451,7 @@ describe('SessionAuthGate status-check failure behavior', () => {
   });
 
   test('keeps the app unmounted until the home directory is known after login', async () => {
-    // First visit to a password-protected server: the page-load attempt could
+    // First visit to an auth-protected server: the page-load attempt could
     // not read the home directory, so it is still unknown at login.
     resetHarness();
     desktopShell = false;
@@ -495,24 +495,24 @@ describe('SessionAuthGate status-check failure behavior', () => {
     expect(collectText(await renderGate())).toContain('child');
   });
 
-  test('discards a password completion after switching to another host', async () => {
+  test('discards an Alcore-token completion after switching to another host', async () => {
     resetHarness();
     desktopShell = true;
     runtimeFetchRejects = false;
     runtimeApiBaseUrl = 'https://host-a.example';
     runtimeKey = 'host:a';
     let resolveLogin: (value: unknown) => void = () => {
-      throw new Error('Password login did not start');
+      throw new Error('Alcore login did not start');
     };
     desktopInvoke = () => new Promise((resolve) => { resolveLogin = resolve; });
 
     const lockedTree = await renderGate();
     const input = findElement(lockedTree, 'input');
     expect(input).not.toBeNull();
-    (input?.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: 'password-a' } });
+    (input?.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: 'token-a' } });
 
-    const passwordTree = await renderGate();
-    const form = findElement(passwordTree, 'form');
+    const tokenTree = await renderGate();
+    const form = findElement(tokenTree, 'form');
     expect(form).not.toBeNull();
     const pending = (form?.props.onSubmit as (event: { preventDefault: () => void }) => Promise<void>)({ preventDefault: () => undefined });
     await Promise.resolve();

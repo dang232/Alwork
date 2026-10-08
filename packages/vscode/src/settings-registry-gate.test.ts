@@ -8,17 +8,16 @@ const fields: SettingsRegistryGateFields = {
   hasDesktopSettings: { scope: 'instance', computed: true },
   sidebarWidth: { scope: 'device', local: true },
   windowBounds: { scope: 'instance', owner: 'desktop-shell' },
-  desktopUiPassword: { scope: 'instance', secret: true },
+  managedRemoteTunnelToken: { scope: 'instance', secret: true },
 };
 
 describe('withoutSecretSettings', () => {
   test('withholds secret keys and keeps everything else', () => {
-    assert.deepEqual(withoutSecretSettings({ desktopUiPassword: 'pw', themeId: 'a' }, fields), { themeId: 'a' });
+    assert.deepEqual(withoutSecretSettings({ managedRemoteTunnelToken: 'pw', themeId: 'a' }, fields), { themeId: 'a' });
   });
 
-  test('the real registry marks the UI password and tunnel tokens secret', () => {
+  test('the real registry marks the tunnel tokens secret', () => {
     const stripped = withoutSecretSettings({
-      desktopUiPassword: 'pw',
       managedRemoteTunnelToken: 't',
       managedRemoteTunnelPresetTokens: { a: 't' },
       themeId: 'a',

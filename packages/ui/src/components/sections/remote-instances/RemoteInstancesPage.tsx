@@ -184,16 +184,16 @@ const instanceStateLabelKey = (state: InstanceState): I18nKey => {
 
 // Known backend failures that the user can act on from here. Everything else
 // falls back to the raw detail plus the logs button.
-type ErrorRemedy = 'uiPassword' | 'localPort' | 'noRuntime' | 'noOpencode' | 'externalPort' | null;
+type ErrorRemedy = 'alcoreSecret' | 'localPort' | 'noRuntime' | 'noOpencode' | 'externalPort' | null;
 
 const errorRemedy = (detail?: string): ErrorRemedy => {
   const text = (detail || '').toLowerCase();
   if (!text) return null;
-  if (text.includes('ui authentication') || text.includes('ui password')) return 'uiPassword';
+  if (text.includes('ui authentication') || text.includes('ui password') || text.includes('alcore secret')) return 'alcoreSecret';
   if (text.includes('already in use') || text.includes('eaddrinuse')) return 'localPort';
   if (text.includes('neither bun nor npm')) return 'noRuntime';
   if (text.includes('opencode cli is not installed')) return 'noOpencode';
-  if (text.includes('requires a ui password')) return 'uiPassword';
+  if (text.includes('requires a ui password')) return 'alcoreSecret';
   if (text.includes('preferred remote openchamber port')) return 'externalPort';
   return null;
 };
@@ -1197,11 +1197,11 @@ export const RemoteInstancesPage: React.FC = () => {
     if (
       normalized.remoteOpenchamber.mode === 'managed' &&
       normalized.remoteOpenchamber.bindHost === '0.0.0.0' &&
-      !normalized.auth.openchamberPassword?.value?.trim()
+      !normalized.auth.alcoreSecret?.value?.trim()
     ) {
-      toast.error(t('settings.remoteInstances.page.validation.remoteLanNeedsPassword'));
+      toast.error(t('settings.remoteInstances.page.validation.remoteLanNeedsAlcoreSecret'));
       setAdvancedOpen(true);
-      window.setTimeout(() => uiPasswordRef.current?.focus(), 0);
+      window.setTimeout(() => alcoreSecretRef.current?.focus(), 0);
       return;
     }
 
@@ -1226,15 +1226,15 @@ export const RemoteInstancesPage: React.FC = () => {
     }
 
     if (
-      normalized.auth.openchamberPassword?.enabled &&
-      normalized.auth.openchamberPassword.value?.trim() &&
-      normalized.auth.openchamberPassword.store !== 'settings'
+      normalized.auth.alcoreSecret?.enabled &&
+      normalized.auth.alcoreSecret.value?.trim() &&
+      normalized.auth.alcoreSecret.store !== 'settings'
     ) {
-      const store = await confirmSsh('settings.remoteInstances.page.confirm.storeUiPasswordPlaintext');
+      const store = await confirmSsh('settings.remoteInstances.page.confirm.storeAlcoreSecretPlaintext');
       if (store === null) return;
-      normalized.auth.openchamberPassword.store = store ? 'settings' : 'never';
+      normalized.auth.alcoreSecret.store = store ? 'settings' : 'never';
       if (!store) {
-        normalized.auth.openchamberPassword.value = undefined;
+        normalized.auth.alcoreSecret.value = undefined;
       }
     }
 
@@ -1369,7 +1369,7 @@ export const RemoteInstancesPage: React.FC = () => {
     }
   }, [confirmSsh, connect, selectedInstance, t, upsertInstance]);
 
-  const uiPasswordRef = React.useRef<HTMLInputElement | null>(null);
+  const alcoreSecretRef = React.useRef<HTMLInputElement | null>(null);
   const remotePortRef = React.useRef<HTMLDivElement | null>(null);
 
   // Turn a reported failure into the one action that resolves it, instead of
@@ -1399,8 +1399,8 @@ export const RemoteInstancesPage: React.FC = () => {
 
     setAdvancedOpen(true);
     window.setTimeout(() => {
-      if (remedy === 'uiPassword') {
-        uiPasswordRef.current?.focus();
+      if (remedy === 'alcoreSecret') {
+        alcoreSecretRef.current?.focus();
         return;
       }
       remotePortRef.current?.scrollIntoView({ block: 'center' });
@@ -1507,11 +1507,11 @@ export const RemoteInstancesPage: React.FC = () => {
       !canDisconnect &&
       draft.remoteOpenchamber.mode === 'managed' &&
       draft.remoteOpenchamber.bindHost === '0.0.0.0' &&
-      !draft.auth.openchamberPassword?.value?.trim()
+      !draft.auth.alcoreSecret?.value?.trim()
     ) {
-      toast.error(t('settings.remoteInstances.page.validation.remoteLanNeedsPassword'));
+      toast.error(t('settings.remoteInstances.page.validation.remoteLanNeedsAlcoreSecret'));
       setAdvancedOpen(true);
-      window.setTimeout(() => uiPasswordRef.current?.focus(), 0);
+      window.setTimeout(() => alcoreSecretRef.current?.focus(), 0);
       return;
     }
 
@@ -2172,10 +2172,10 @@ export const RemoteInstancesPage: React.FC = () => {
   }
 
   const isManagedMode = draft.remoteOpenchamber.mode === 'managed';
-  // Publishing the remote server to its network turns the UI password from an
-  // option into the only thing standing in front of it.
+  // Publishing the remote server to its network turns the Alcore secret from
+  // an option into the only thing standing in front of it.
   const remoteLanExposed = isManagedMode && draft.remoteOpenchamber.bindHost === '0.0.0.0';
-  const uiPasswordMissing = remoteLanExposed && !draft.auth.openchamberPassword?.value?.trim();
+  const alcoreSecretMissing = remoteLanExposed && !draft.auth.alcoreSecret?.value?.trim();
   const instanceTitle = draft.nickname?.trim() || draft.sshParsed?.destination || draft.id;
 
   return (
@@ -2271,8 +2271,8 @@ export const RemoteInstancesPage: React.FC = () => {
                   className="!font-normal"
                   onClick={() => void applyErrorRemedy(currentRemedy)}
                 >
-                  {currentRemedy === 'uiPassword'
-                    ? t('settings.remoteInstances.page.error.action.setUiPassword')
+                  {currentRemedy === 'alcoreSecret'
+                    ? t('settings.remoteInstances.page.error.action.setAlcoreSecret')
                     : currentRemedy === 'localPort'
                       ? t('settings.remoteInstances.page.error.action.pickRandomPort')
                       : t('settings.remoteInstances.page.error.action.setRemotePort')}
@@ -2649,38 +2649,38 @@ export const RemoteInstancesPage: React.FC = () => {
             <div className="w-56 shrink-0">
               <HintLabel
                 label={remoteLanExposed
-                  ? t('settings.remoteInstances.page.field.uiPasswordRequired')
-                  : t('settings.remoteInstances.page.field.uiPasswordOptional')}
+                  ? t('settings.remoteInstances.page.field.alcoreSecretRequired')
+                  : t('settings.remoteInstances.page.field.alcoreSecretOptional')}
                 hint={isManagedMode
-                  ? t('settings.remoteInstances.page.field.uiPasswordHintManaged')
-                  : t('settings.remoteInstances.page.field.uiPasswordHintExternal')}
+                  ? t('settings.remoteInstances.page.field.alcoreSecretHintManaged')
+                  : t('settings.remoteInstances.page.field.alcoreSecretHintExternal')}
               />
             </div>
             <Input
-              className={cn('h-7 md:max-w-sm', uiPasswordMissing && 'border-[var(--status-error)]')}
+              className={cn('h-7 md:max-w-sm', alcoreSecretMissing && 'border-[var(--status-error)]')}
               type="password"
-              ref={uiPasswordRef}
-              aria-invalid={uiPasswordMissing}
-              value={draft.auth.openchamberPassword?.value || ''}
+              ref={alcoreSecretRef}
+              aria-invalid={alcoreSecretMissing}
+              value={draft.auth.alcoreSecret?.value || ''}
               onChange={(event) =>
                 updateDraft((current) => ({
                   ...current,
                   auth: {
                     ...current.auth,
-                    openchamberPassword: {
+                    alcoreSecret: {
                       enabled: event.target.value.trim().length > 0,
                       value: event.target.value,
-                      store: current.auth.openchamberPassword?.store || 'never',
+                      store: current.auth.alcoreSecret?.store || 'never',
                     },
                   },
                 }))
               }
-              placeholder={t('settings.remoteInstances.page.field.uiPasswordPlaceholder')}
+              placeholder={t('settings.remoteInstances.page.field.alcoreSecretPlaceholder')}
             />
           </div>
-          {uiPasswordMissing ? (
+          {alcoreSecretMissing ? (
             <p className="typography-micro text-[var(--status-error)] md:pl-[16rem]">
-              {t('settings.remoteInstances.page.field.uiPasswordMissingForLan')}
+              {t('settings.remoteInstances.page.field.alcoreSecretMissingForLan')}
             </p>
           ) : null}
       </SettingsSection>

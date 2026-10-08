@@ -327,9 +327,6 @@ export const createSettingsHelpers = (dependencies) => {
     if (typeof candidate.messageSearchReasoningEnabled === 'boolean') {
       result.messageSearchReasoningEnabled = candidate.messageSearchReasoningEnabled;
     }
-    if (typeof candidate.desktopUiPassword === 'string') {
-      result.desktopUiPassword = candidate.desktopUiPassword.trim();
-    }
     if (Array.isArray(candidate.projects)) {
       const projects = sanitizeProjects(candidate.projects);
       if (projects) {
@@ -1115,7 +1112,6 @@ export const createSettingsHelpers = (dependencies) => {
     }
     const bookmarks = normalizeStringArray(settings.securityScopedBookmarks);
     const hasManagedRemoteTunnelToken = typeof settings?.managedRemoteTunnelToken === 'string' && settings.managedRemoteTunnelToken.trim().length > 0;
-    const hasDesktopUiPassword = typeof settings?.desktopUiPassword === 'string' && settings.desktopUiPassword.trim().length > 0;
     const pwaAppName = normalizePwaAppName(settings?.pwaAppName, '');
     const pwaOrientation = normalizePwaOrientation(settings?.pwaOrientation, 'system');
     const mobileKeyboardMode = normalizeMobileKeyboardMode(settings?.mobileKeyboardMode, 'native');
@@ -1125,7 +1121,6 @@ export const createSettingsHelpers = (dependencies) => {
     return {
       ...sanitized,
       hasManagedRemoteTunnelToken,
-      hasDesktopUiPassword,
       // Tells the client whether agent memory exists in this build at all, so
       // its settings row and panel tab can be absent rather than merely off.
       agentMemoryFeatureAvailable: isAgentMemoryFeatureAvailable(),
@@ -1143,7 +1138,7 @@ export const createSettingsHelpers = (dependencies) => {
         ? {
             desktopLanAccessActive: process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_ACTIVE === 'true',
             desktopLanAccessBlockedReason:
-              process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON === 'missing-password'
+              process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON === 'missing-alcore-secret'
                 || process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON === 'enterprise-mode'
                 ? process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON
                 : null,

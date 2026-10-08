@@ -80,20 +80,6 @@
         "desktop"
       ]
     },
-    "desktopUiPassword": {
-      "scope": "instance",
-      "surfaces": [
-        "desktop"
-      ],
-      "secret": true
-    },
-    "hasDesktopUiPassword": {
-      "scope": "instance",
-      "surfaces": [
-        "desktop"
-      ],
-      "computed": true
-    },
     "desktopLanAccessActive": {
       "scope": "instance",
       "surfaces": [

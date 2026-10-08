@@ -99,7 +99,7 @@ export const PasskeySettings: React.FC = () => {
 
   const handleRegisterPasskey = React.useCallback(async () => {
     if (!status.enabled) {
-      const message = t('settings.openchamber.passkeys.toast.enableUiPasswordFirst');
+      const message = t('settings.openchamber.passkeys.toast.enableAlcoreLoginFirst');
       setErrorMessage(message);
       toast.message(message);
       return;
@@ -200,7 +200,7 @@ export const PasskeySettings: React.FC = () => {
 
         {!status.enabled && (
           <p className="typography-meta text-muted-foreground">
-            {t('settings.openchamber.passkeys.state.uiPasswordRequired')}
+            {t('settings.openchamber.passkeys.state.alcoreLoginRequired')}
           </p>
         )}
 

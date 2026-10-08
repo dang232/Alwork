@@ -89,6 +89,7 @@ import { mintOutsideFileGrant } from '@openchamber/web/server/lib/fs/routes.js';
 import { fetchUpdateNotes } from '@openchamber/web/server/lib/changelog/update-notes.js';
 import { applyConnectAttemptTimeout } from '@openchamber/web/server/lib/network-defaults.js';
 import { isNetworkAccessBlocked } from '@openchamber/web/server/lib/enterprise-mode.js';
+import { isUnsafeUnauthenticatedLanAllowed } from '@openchamber/web/server/lib/security/bind-host.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1314,17 +1315,22 @@ const spawnLocalServer = async () => {
   // warning and persists the flag via /api/config/settings.
   const lanAccessEnabled = settings.desktopLanAccessEnabled === true;
   setDesktopKeepAwakeActive(settings.desktopKeepAwakeEnabled === true);
-  const desktopUiPassword = typeof settings.desktopUiPassword === 'string' ? settings.desktopUiPassword.trim() : '';
   // Enterprise mode keeps the app on this machine unless the administrator
   // allowed network access (the server refuses a network bind as well).
   const lanAccessBlockedByEnterprise = lanAccessEnabled && isNetworkAccessBlocked();
-  const lanAccessBlockedByMissingPassword = lanAccessEnabled && !lanAccessBlockedByEnterprise && !desktopUiPassword;
-  const effectiveLanAccessEnabled = lanAccessEnabled && !lanAccessBlockedByEnterprise && !lanAccessBlockedByMissingPassword;
+  // The server refuses a network bind without its Alcore secret, so LAN
+  // access without one would fail startup: stay on loopback instead.
+  const lanAccessSecret = [process.env.ALCORE_JWT_SECRET, process.env.JWT_SECRET]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .find((value) => value) || '';
+  const lanAccessBlockedByMissingSecret = lanAccessEnabled && !lanAccessBlockedByEnterprise
+    && !lanAccessSecret && !isUnsafeUnauthenticatedLanAllowed(process.env);
+  const effectiveLanAccessEnabled = lanAccessEnabled && !lanAccessBlockedByEnterprise && !lanAccessBlockedByMissingSecret;
   const bindHost = effectiveLanAccessEnabled ? LAN_BIND_HOST : LOOPBACK_BIND_HOST;
   if (lanAccessBlockedByEnterprise) {
     log.warn('[desktop] LAN access is turned off by enterprise mode; starting on loopback only.');
-  } else if (lanAccessBlockedByMissingPassword) {
-    log.warn('[desktop] LAN access was requested without a desktop UI password; starting on loopback only.');
+  } else if (lanAccessBlockedByMissingSecret) {
+    log.warn('[desktop] LAN access was requested without an Alcore secret; starting on loopback only.');
   }
 
   // Probe before starting the server — main() in the server module sets up a
@@ -1350,8 +1356,8 @@ const spawnLocalServer = async () => {
   process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_ACTIVE = effectiveLanAccessEnabled ? 'true' : 'false';
   if (lanAccessBlockedByEnterprise) {
     process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'enterprise-mode';
-  } else if (lanAccessBlockedByMissingPassword) {
-    process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'missing-password';
+  } else if (lanAccessBlockedByMissingSecret) {
+    process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'missing-alcore-secret';
   } else {
     delete process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON;
   }
@@ -1629,12 +1635,12 @@ const extractCookieHeader = (response) => {
     .join('; ');
 };
 
-const loginRemoteAndIssueClientToken = async ({ url, password, trustDevice, requestHeaders }) => {
+const loginRemoteAndIssueClientToken = async ({ url, alcoreToken, trustDevice, requestHeaders }) => {
   const baseUrl = normalizeHostUrl(String(url || ''));
-  const candidatePassword = typeof password === 'string' ? password : '';
+  const candidateToken = typeof alcoreToken === 'string' ? alcoreToken.trim() : '';
   const safeRequestHeaders = sanitizeRuntimeRequestHeaders(requestHeaders || {});
   if (!baseUrl) throw new Error('Invalid URL');
-  if (!candidatePassword) throw new Error('Password is required');
+  if (!candidateToken) throw new Error('Alcore token is required');
 
   // Stable client identity so re-login reuses the same device record. Local
   // uses the fixed desktop-local identity; remote uses this install's id with a
@@ -1656,7 +1662,7 @@ const loginRemoteAndIssueClientToken = async ({ url, password, trustDevice, requ
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      password: candidatePassword,
+      alcoreToken: candidateToken,
       trustDevice: trustDevice === true,
       issueClientToken: true,
       clientLabel: 'OpenChamber Desktop',
@@ -4578,10 +4584,10 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
         String(args.expectedServerId || ''),
       ));
 
-    case 'desktop_remote_password_login':
+    case 'desktop_remote_alcore_login':
       return loginRemoteAndIssueClientToken({
         url: args.url,
-        password: args.password,
+        alcoreToken: args.alcoreToken,
         trustDevice: args.trustDevice === true,
         requestHeaders: args.requestHeaders || {},
       });
