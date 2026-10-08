@@ -1,0 +1,57 @@
+{
+  "$comment": "Task-12 workspace-root wiring (project-ide todo 12). The IDE (this Alwork worktree, branch alwork-ide-wave1) opens exactly these four roots. Each root resolves its own agents/context files; cross-root access is denied unless explicitly scoped here. No repos merged, no product code moved.",
+  "version": 1,
+  "workspaceFile": "alwork-ide-wave1.code-workspace",
+  "host": {
+    "repo": "Alwork worktree I:/migration/Alwork-wt/wave1",
+    "branch": "alwork-ide-wave1",
+    "note": "IDE host code lives here; it is NOT a workspace folder. Never open or edit I:/migration/Alwork (the sibling checkout) from this workspace."
+  },
+  "roots": {
+    "migration-root": {
+      "path": "I:/migration",
+      "agentsFile": null,
+      "agentsNote": "No AGENTS.md at this root (verified 2026-10-08). Authority is the plan plus auth docs.",
+      "contextFiles": [
+        "ALcore_Unified_Migration_Plan_v2.md",
+        ".omo/plans/project-ide.md",
+        "docs/auth/API-CONTRACT.md"
+      ],
+      "scope": "Plans and docs only. Nested checkouts (auth-service, libre-webui, AlRepo, Alwork, oh-my-openAlcore) must be edited through their dedicated roots, never via this root."
+    },
+    "auth-service": {
+      "path": "I:/migration/auth-service",
+      "agentsFile": null,
+      "agentsNote": "No AGENTS.md in this repo (verified 2026-10-08). Authority is README.md plus package.json scripts.",
+      "contextFiles": ["package.json", "README.md", "src/routes/auth.ts", "src/lib/auth-models.ts"],
+      "runtime": "Bun only: bun test, bun run --hot src/index.ts, tsc --noEmit",
+      "scope": "Identity-only WHO (users, provider_identities, sessions, oidc_codes, product_exchange_codes). No customers, billing, balances, usage, keys, subscriptions."
+    },
+    "libre-webui": {
+      "path": "I:/migration/libre-webui",
+      "agentsFile": "AGENTS.md",
+      "contextFiles": ["AGENTS.md", "frontend/package.json", "backend/src/main.ts", "plugins"],
+      "runtime": "Node.js 22.22+ and npm only. Never pnpm, Yarn, or Bun in this repo.",
+      "scope": "Self-hosted local-first AI workspace (frontend React 19 + backend Express 5). TokenPanel skills and TokenPanel DB schemas must never load here."
+    },
+    "AlRepo": {
+      "path": "I:/migration/AlRepo",
+      "agentsFile": "AGENTS.md",
+      "contextFiles": [
+        "AGENTS.md",
+        "package.json",
+        "packages/config/src/fields.ts",
+        "apps/api/src/config/runtime.ts"
+      ],
+      "runtime": "Bun only with turbo workspaces (bun install, bun run dev/build/typecheck, bun test)",
+      "scope": "TokenPanel usage tracking and access control. Auth-service identity tables must never be edited here; link by customer.authUserId only."
+    }
+  },
+  "crossRoot": {
+    "default": "denied",
+    "allowedRoots": ["migration-root", "auth-service", "libre-webui", "AlRepo"],
+    "nestedRule": "Paths under I:/migration/auth-service, I:/migration/libre-webui, or I:/migration/AlRepo reached through migration-root resolve to their dedicated root instead.",
+    "unknownRoot": "Any root name not in allowedRoots is rejected with OMO_WORKSPACE_UNKNOWN_ROOT; nothing resolves, nothing is created.",
+    "outOfScopeExample": "I:/migration/oh-my-openAlcore is NOT a workspace root: engine sources stay out of the IDE roots (SUL boundary)."
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "folders": [
+    {
+      "name": "migration-root",
+      "path": "I:/migration"
+    },
+    {
+      "name": "auth-service",
+      "path": "I:/migration/auth-service"
+    },
+    {
+      "name": "libre-webui",
+      "path": "I:/migration/libre-webui"
+    },
+    {
+      "name": "AlRepo",
+      "path": "I:/migration/AlRepo"
+    }
+  ],
+  "settings": {
+    "search.useIgnoreFiles": true,
+    "search.exclude": {
+      "**/node_modules": true,
+      "**/backend/dist": true,
+      "**/frontend/dist": true,
+      "**/.git": true
+    },
+    "files.watcherExclude": {
+      "**/node_modules/**": true,
+      "**/backend/dist/**": true,
+      "**/frontend/dist/**": true,
+      "**/.git/**": true
+    }
+  }
+}
