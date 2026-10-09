@@ -75,7 +75,16 @@ const servicePairSchema = z.object({
   // JWT (absent until its track lands): captured to the keychain with the
   // access token, never required for the login itself.
   refresh_token: z.string().trim().min(1).max(4096).optional(),
+  // The user-scoped IDE access token the desktop-code completion nests
+  // under user_token: the top-level access_token is the SESSION token
+  // (session creation + introspection), while the keychain MUST hold this
+  // one (TokenPanel user-JWT reads). Preferred for capture when present.
+  user_access_token: z.string().trim().min(1).max(4096).optional(),
 });
+// Keychain capture prefers the user-scoped access token over the session
+// token: presenting the session token to user-scoped reads 403s
+// (missing_scope) while the subject still matches, a silent dead end.
+const captureAccessOf = (data) => (data?.user_access_token?.trim() || data?.access_token?.trim() || '');
 // Upstream error codes are named, not free text: only codes matching the
 // service's own machine-code shape pass through to the failure page.
 const serviceErrorSchema = z.object({ error: z.string().regex(/^[A-Za-z0-9_]{1,64}$/) });
@@ -298,6 +307,7 @@ export const createDesktopAuthRuntime = ({
   const completeWithServicePair = async (req, res, pair, sessionOpts, completionProfile = null) => {
     const parsedPair = servicePairSchema.safeParse(pair);
     const token = parsedPair.success ? parsedPair.data.access_token.trim() : '';
+    const captureToken = parsedPair.success ? captureAccessOf(parsedPair.data) : '';
     const refreshToken = parsedPair.success ? (parsedPair.data.refresh_token ?? '') : '';
     if (token === '') {
       return res.status(502).json({ error: 'unavailable' });
@@ -313,7 +323,7 @@ export const createDesktopAuthRuntime = ({
       // The session owner just verified this pair (local HMAC): the decode
       // below is keying only — trust comes from the 200 above, and the
       // unverified sub never gates anything.
-      await captureUserTokens(decodeAccessTokenSub(token), token, refreshToken, res);
+      await captureUserTokens(decodeAccessTokenSub(captureToken), captureToken, refreshToken, res);
       return;
     }
     // Packaged desktop: no shared secret is available (and none is shipped
@@ -333,7 +343,7 @@ export const createDesktopAuthRuntime = ({
     req.body = sessionBodyOf(sessionOpts, sessionExtra);
     await uiAuthController.handleServiceVerifiedSessionCreate(req, res, { sub: confirmed.sub, sid: confirmed.sid });
     // The subject here was confirmed live against the service itself.
-    await captureUserTokens(confirmed.sub, token, refreshToken, res);
+    await captureUserTokens(confirmed.sub, captureToken, refreshToken, res);
     return;
   };
 
@@ -574,6 +584,9 @@ ${detailLine}
       return fail(pending.failure.status, pending.failure);
     }
     pending.pair = accessToken;
+    // Keep the nested user-scoped access beside the session token so
+    // completion keychains the TokenPanel-capable one (see schema note).
+    pending.userAccessToken = z.string().trim().min(1).safeParse(exchange.data?.user_token?.access_token).data ?? '';
     // The loopback completion must carry BOTH tokens: the refresh token
     // rides the server-held pending entry (never the browser, never the
     // poll body) into google-complete, where capture keychains it.
@@ -729,6 +742,7 @@ ${detailLine}
       // binds the profile and the keychain capture takes the pair.
       const completionProfile = pending.profile ?? null;
       const completionPair = { access_token: parsedPair.data.access_token.trim() };
+      if (pending.userAccessToken) completionPair.user_access_token = pending.userAccessToken;
       const pendingRefresh = z.string().trim().min(1).safeParse(pending.refreshToken).data;
       if (pendingRefresh !== undefined) {
         completionPair.refresh_token = pendingRefresh;
