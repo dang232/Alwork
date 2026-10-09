@@ -81,6 +81,50 @@ export const parseAccountQuota = (payload: AccountQuotaPayload): AccountQuota =>
 export const quotaAvailableMajor = (balance: AccountQuotaBalance): number =>
   balance.availableMicros / 1_000_000;
 
+/** Usage cost micros to major units at the display boundary only. */
+export const quotaCostMajor = (usage: AccountQuotaUsage): number => usage.totalCostMicros / 1_000_000;
+
+/**
+ * Balance shares as 0–100 percents for the progress-bar rows. The only
+ * percent the TokenPanel quota read API can support: no plan windows,
+ * limits, or reset times exist server-side, so usage totals (tokens,
+ * requests, cost) render as value rows without a bar. Nulls when there is
+ * no positive total to share (a zero-amount balance shows its value
+ * without a bar, like the usage panel's balance-only windows).
+ */
+export interface QuotaBalanceShare {
+  availablePercent: number | null;
+  usedPercent: number | null;
+}
+
+export const quotaBalanceShares = (balance: AccountQuotaBalance): QuotaBalanceShare => {
+  if (
+    !Number.isFinite(balance.amountMicros) ||
+    !Number.isFinite(balance.availableMicros) ||
+    !Number.isFinite(balance.reservedMicros) ||
+    balance.amountMicros <= 0
+  ) {
+    return { availablePercent: null, usedPercent: null };
+  }
+  const toPercent = (micros: number): number =>
+    Math.max(0, Math.min(100, Math.round((micros / balance.amountMicros) * 100)));
+  return { availablePercent: toPercent(balance.availableMicros), usedPercent: toPercent(balance.reservedMicros) };
+};
+
+/**
+ * Currency formatting that never throws on an unexpected currency code.
+ * The quota schema bounds the code's length, not its ISO validity, and a
+ * panel must never blank-crash on it — so an unknown code falls back to a
+ * plain major-units rendering instead of the Intl throw.
+ */
+export const formatQuotaMoney = (micros: number, currency: string): string => {
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(micros / 1_000_000);
+  } catch {
+    return `${(micros / 1_000_000).toFixed(2)} ${currency}`;
+  }
+};
+
 const QUOTA_REFRESH_MS = 3 * 60 * 1000;
 
 /** The proxy's TokenPanel-session-expired signal: refresh is dead, sign out. */
@@ -115,12 +159,40 @@ export const fetchAccountQuota = async (authUserId: string, signal: AbortSignal)
 /**
  * Live quota for the signed-in identity. Fetches on mount/subject change,
  * refreshes every 3 minutes while mounted, and re-fetches on runtime
- * endpoint switches. Returns null while the first read is in flight
- * (loading), then a stable `AccountQuota` — failures land on
+ * endpoint switches. Returns the quota (null while the first read is in
+ * flight) plus a `refresh` for panel-open and manual refreshes — the
+ * refresh silently replaces the value when it lands, so opening the panel
+ * never flashes a loader over the last-known numbers. Failures land on
  * `unavailable`, never null, so callers never blank-crash.
  */
-export const useAccountQuota = (authUserId: string | null): AccountQuota | null => {
+interface AccountQuotaRead {
+  quota: AccountQuota | null;
+  refresh: () => void;
+}
+
+export const useAccountQuota = (authUserId: string | null): AccountQuotaRead => {
   const [quota, setQuota] = React.useState<AccountQuota | null>(null);
+  const mountedRef = React.useRef(true);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const refresh = React.useCallback(() => {
+    if (authUserId === null || authUserId === '') {
+      if (mountedRef.current) setQuota({ state: 'unavailable' });
+      return;
+    }
+    const controller = new AbortController();
+    void fetchAccountQuota(authUserId, controller.signal)
+      .then((next) => {
+        if (mountedRef.current) setQuota(next);
+      })
+      .catch(() => {
+        if (mountedRef.current) setQuota({ state: 'unavailable' });
+      });
+  }, [authUserId]);
   React.useEffect(() => {
     if (authUserId === null || authUserId === '') {
       setQuota({ state: 'unavailable' });
@@ -137,8 +209,8 @@ export const useAccountQuota = (authUserId: string | null): AccountQuota | null 
         if (!settled) setQuota({ state: 'unavailable' });
       });
     const timer = window.setInterval(() => {
-      const refresh = new AbortController();
-      void fetchAccountQuota(authUserId, refresh.signal)
+      const periodic = new AbortController();
+      void fetchAccountQuota(authUserId, periodic.signal)
         .then((next) => {
           if (!settled) setQuota(next);
         })
@@ -164,5 +236,5 @@ export const useAccountQuota = (authUserId: string | null): AccountQuota | null 
       unsubscribe();
     };
   }, [authUserId]);
-  return quota;
+  return { quota, refresh };
 };

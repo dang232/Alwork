@@ -15,7 +15,8 @@ import { signOutToGate } from './signOutToGate';
 import { useAuthSessionStore } from '@/lib/runtime-auth-expiry';
 import { toast } from '@/components/ui';
 import { parseAccountSession, type AccountSession } from './accountSession';
-import { quotaAvailableMajor, useAccountQuota } from './accountQuota';
+import { useAccountQuota } from './accountQuota';
+import { AccountQuotaSection } from './accountQuotaSection';
 
 // Header account surface (all runtimes except VS Code, where auth is
 // skipped). Reads the existing desktop-auth session shape only:
@@ -105,7 +106,7 @@ export const AccountProfile: React.FC = () => {
   }, []);
 
   const quotaSubject = session !== null && session.status === 'signed-in' ? session.subject : null;
-  const quota = useAccountQuota(isVSCode ? null : quotaSubject);
+  const { quota, refresh: refreshQuota } = useAccountQuota(isVSCode ? null : quotaSubject);
 
   const handleSignOut = React.useCallback(async () => {
     if (signingOut) return;
@@ -116,6 +117,13 @@ export const AccountProfile: React.FC = () => {
       toast.error(t('sessionAuth.error.networkRetry'));
     }
   }, [signingOut, t]);
+
+  const handleQuotaOpenChange = React.useCallback(
+    (nextOpen: boolean) => {
+      if (nextOpen) refreshQuota();
+    },
+    [refreshQuota],
+  );
 
   if (isVSCode) return null;
 
@@ -147,26 +155,10 @@ export const AccountProfile: React.FC = () => {
   }
 
   const label = session.displayName || t('header.account.profileLabel');
-  const quotaText =
-    quota === null
-        ? t('header.account.quotaLoading')
-        : quota.state === 'unavailable'
-          ? t('header.account.quotaUnavailable')
-          : (() => {
-              const available = new Intl.NumberFormat(undefined, {
-                style: 'currency',
-                currency: quota.balance.currency,
-              }).format(quotaAvailableMajor(quota.balance));
-              const tokens = new Intl.NumberFormat(undefined).format(quota.usage.totalTokens);
-              return quota.state === 'live'
-                ? t('header.account.quotaLive', { available, tokens })
-                : t('header.account.quotaStale', { available, tokens });
-            })();
-  const quotaState = quota === null ? 'loading' : quota.state;
 
   return (
     <div className="app-region-no-drag flex shrink-0 items-center">
-      <DropdownMenu>
+      <DropdownMenu onOpenChange={handleQuotaOpenChange}>
         <DropdownMenuTrigger asChild>
           <button
             type="button"
@@ -204,15 +196,10 @@ export const AccountProfile: React.FC = () => {
                   {session.tier}
                 </span>
               ) : null}
-              <span
-                data-testid="account-quota"
-                data-quota-state={quotaState}
-                className="mt-1 inline-block rounded-full border border-border px-2 py-px typography-micro text-muted-foreground"
-              >
-                {quotaText}
-              </span>
             </div>
           </div>
+          <DropdownMenuSeparator />
+          <AccountQuotaSection quota={quota} onRefresh={refreshQuota} />
           <DropdownMenuSeparator />
           <div className="p-2">
             <Button

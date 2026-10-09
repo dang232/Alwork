@@ -2,9 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import { clearAutoSignOutMark } from './signOutToGate';
 import {
   fetchAccountQuota,
+  formatQuotaMoney,
   isTokenpanelSessionExpired,
   parseAccountQuota,
   quotaAvailableMajor,
+  quotaBalanceShares,
+  quotaCostMajor,
   type AccountQuotaPayload,
 } from './accountQuota';
 
@@ -49,6 +52,56 @@ describe('parseAccountQuota', () => {
 
   test('missing subject means no query — callers map it to unavailable', () => {
     expect(''.length).toBe(0);
+  });
+});
+
+describe('quotaBalanceShares', () => {
+  test('splits a balance into available and reserved percents', () => {
+    expect(
+      quotaBalanceShares({ amountMicros: 2_000_000, reservedMicros: 750_000, availableMicros: 1_250_000, currency: 'USD' }),
+    ).toEqual({ availablePercent: 63, usedPercent: 38 });
+  });
+
+  test('a zero or negative total has no share to show (value row without a bar)', () => {
+    for (const amountMicros of [0, -100]) {
+      expect(
+        quotaBalanceShares({ amountMicros, reservedMicros: 0, availableMicros: 0, currency: 'USD' }),
+      ).toEqual({ availablePercent: null, usedPercent: null });
+    }
+  });
+
+  test('non-finite inputs are missing shares, never NaN widths', () => {
+    for (const balance of [
+      { amountMicros: Number.NaN, reservedMicros: 0, availableMicros: 0, currency: 'USD' },
+      { amountMicros: 100, reservedMicros: Number.POSITIVE_INFINITY, availableMicros: 0, currency: 'USD' },
+      { amountMicros: 100, reservedMicros: 0, availableMicros: Number.NaN, currency: 'USD' },
+    ]) {
+      expect(quotaBalanceShares(balance)).toEqual({ availablePercent: null, usedPercent: null });
+    }
+  });
+
+  test('clamps over-reserved balances instead of overflowing the bar', () => {
+    expect(
+      quotaBalanceShares({ amountMicros: 100, reservedMicros: 250, availableMicros: -150, currency: 'USD' }),
+    ).toEqual({ availablePercent: 0, usedPercent: 100 });
+  });
+});
+
+describe('quotaCostMajor', () => {
+  test('converts usage cost micros to major units', () => {
+    expect(
+      quotaCostMajor({ totalRequests: 42, totalTokens: 1200, totalCostMicros: 300_000, totalPriceMicros: 500_000, currency: 'USD' }),
+    ).toBe(0.3);
+  });
+});
+
+describe('formatQuotaMoney', () => {
+  test('formats known currencies with Intl', () => {
+    expect(formatQuotaMoney(1_250_000, 'USD')).toContain('1.25');
+  });
+
+  test('an unexpected currency code falls back instead of throwing', () => {
+    expect(formatQuotaMoney(1_250_000, '!!!')).toBe('1.25 !!!');
   });
 });
 
