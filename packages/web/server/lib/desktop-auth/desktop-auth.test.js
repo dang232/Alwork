@@ -43,11 +43,20 @@ const createHarness = ({
   serviceImpl,
   tunnelScope = null,
   alcoreSecret = 'test-alcore-secret-32-chars-long!!',
+  userTokenStore = null,
 } = {}) => {
   const routes = new Map();
   const seenSessions = [];
   const seenVerified = [];
   const serviceCalls = [];
+  const tokenSaves = [];
+  const tokenStore = userTokenStore ?? {
+    saves: tokenSaves,
+    savePair: async (sub, pair) => { tokenSaves.push({ sub, pair }); },
+    readPair: async () => null,
+    clearPair: async () => {},
+    refreshAccessToken: async () => { throw new Error('refresh not stubbed'); },
+  };
   const serviceFetch = async (url, init) => {
     serviceCalls.push({ url, init });
     return serviceImpl(url, init);
@@ -70,6 +79,7 @@ const createHarness = ({
     },
     alcoreSecret,
     serviceFetch,
+    userTokenStore: tokenStore,
   });
   runtime.registerRoutes(
     {
@@ -96,7 +106,7 @@ const createHarness = ({
     await handlers[handlers.length - 1](req, res);
     return { res, headers: resHeaders };
   };
-  return { call, seenSessions, seenVerified, serviceCalls, serviceJson, runtime };
+  return { call, seenSessions, seenVerified, serviceCalls, serviceJson, runtime, tokenSaves, tokenStore };
 };
 
 describe('desktop auth config', () => {
@@ -342,6 +352,9 @@ describe('desktop google loopback', () => {
   const exchangeService = (seen) => async (url, init) => {
     if (url === 'https://auth.alcore.io.vn/auth/google/config') {
       return okJson({ clientId: 'google-client-123' });
+    }
+    if (url === 'https://auth.alcore.io.vn/auth/me') {
+      return okJson({ id: 'user-1', email: 'me@example.test', emailVerified: true });
     }
     expect(url).toBe('https://auth.alcore.io.vn/auth/google/desktop-code');
     const body = JSON.parse(init.body);
@@ -687,6 +700,243 @@ describe('desktop google loopback', () => {
       query: { state: 'b'.repeat(32), code: 'x' },
     });
     expect(landed.res.statusCode).toBe(410);
+  });
+});
+
+describe('desktop login profile capture', () => {
+  const okJson = (data) => ({ status: 200, json: async () => data });
+
+  const startAndLand = async (h, seen) => {
+    const started = await h.call('POST', '/api/auth/desktop/google/start', { body: {} });
+    expect(started.res.statusCode).toBe(200);
+    const { requestId } = started.res.body;
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(200);
+    expect(seen).toHaveLength(1);
+    return requestId;
+  };
+
+  const googleService = (seen, exchangeBody) => async (url) => {
+    if (url.endsWith('/auth/google/config')) return okJson({ clientId: 'google-client-123' });
+    if (url.endsWith('/auth/me')) return okJson({ id: 'user-1', email: 'ada@example.test', emailVerified: true });
+    seen.push(url);
+    return okJson(exchangeBody);
+  };
+
+  test('captures the exchange profile and email into the session body', async () => {
+    const seen = [];
+    const exchangeBody = { access_token: 'desktop-access-token', profile: { name: 'Ada Lovelace', picture: 'https://example.test/ada.png' } };
+    const h = createHarness({ serviceImpl: googleService(seen, exchangeBody) });
+    const requestId = await startAndLand(h, seen);
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+    expect(h.seenSessions[0]).toMatchObject({
+      alcoreToken: 'desktop-access-token',
+      profile: { name: 'Ada Lovelace', picture: 'https://example.test/ada.png', email: 'ada@example.test' },
+    });
+    expect(h.serviceCalls.map((call) => call.url)).toContain('https://auth.alcore.io.vn/auth/me');
+  });
+
+  test('drops malformed profile fields and still completes the login', async () => {
+    const seen = [];
+    const exchangeBody = {
+      access_token: 'desktop-access-token',
+      profile: { name: 'x'.repeat(300), picture: 'http://plain.test/ada.png', nick: 'ada' },
+    };
+    const h = createHarness({ serviceImpl: googleService(seen, exchangeBody) });
+    const requestId = await startAndLand(h, seen);
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+    // Over-long name and non-https picture are dropped; the verified email
+    // still lands, so the session binds a real (partial) profile.
+    expect(h.seenSessions[0].profile).toEqual({ email: 'ada@example.test' });
+    expect(h.serviceCalls.map((call) => call.url)).toContain('https://auth.alcore.io.vn/auth/me');
+  });
+
+  test('completes with name and picture when the email read fails', async () => {
+    const seen = [];
+    const exchangeBody = {
+      access_token: 'desktop-access-token',
+      profile: { name: 'Ada', picture: 'https://example.test/ada.png' },
+    };
+    const h = createHarness({
+      serviceImpl: async (url) => {
+        if (url.endsWith('/auth/google/config')) return okJson({ clientId: 'google-client-123' });
+        if (url.endsWith('/auth/me')) throw new Error('down');
+        seen.push(url);
+        return okJson(exchangeBody);
+      },
+    });
+    const requestId = await startAndLand(h, seen);
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+    expect(h.seenSessions[0].profile).toEqual({ name: 'Ada', picture: 'https://example.test/ada.png' });
+  });
+
+  test('takes the email from the pair user view without an extra read', async () => {
+    const h = createHarness({
+      serviceImpl: async (url) => {
+        if (url === 'https://auth.alcore.io.vn/auth/login') {
+          return h.serviceJson(200, {
+            access_token: 'email-access-token',
+            user: { id: 'user-3', email: 'mail@example.test', emailVerified: true },
+          });
+        }
+        throw new Error(`unexpected service call ${url}`);
+      },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'mail@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+    expect(h.seenSessions[0]).toMatchObject({
+      alcoreToken: 'email-access-token',
+      profile: { email: 'mail@example.test' },
+    });
+    expect(h.serviceCalls.map((call) => call.url)).toEqual(['https://auth.alcore.io.vn/auth/login']);
+  });
+
+  test('ignores client-asserted profile input at completion', async () => {
+    const seen = [];
+    const exchangeBody = { access_token: 'desktop-access-token' };
+    const h = createHarness({ serviceImpl: googleService(seen, exchangeBody) });
+    const requestId = await startAndLand(h, seen);
+    // A hostile poll body cannot mint profile fields: only the server-held
+    // exchange capture (here: none) and the service email land.
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', {
+      body: { requestId, profile: { name: 'Mallory', picture: 'https://evil.test/m.png' } },
+    });
+    expect(done.res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+    expect(h.seenSessions[0].profile).toEqual({ email: 'ada@example.test' });
+    expect(h.serviceCalls.map((call) => call.url)).toContain('https://auth.alcore.io.vn/auth/me');
+  });
+});
+
+describe('desktop login keychain capture', () => {
+  const jwtAccess = (sub) => `header.${Buffer.from(JSON.stringify({ sub, sid: 'sess-1' })).toString('base64url')}.sig`;
+  const okJson = (data) => ({ status: 200, json: async () => data });
+
+  test('email login keychains the pair under the token subject', async () => {
+    const access = jwtAccess('user-1');
+    const h = createHarness({
+      serviceImpl: async () => h.serviceJson(200, { ...SERVICE_PAIR, access_token: access, refresh_token: 'refresh-1' }),
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(h.tokenSaves).toEqual([
+      { sub: 'user-1', pair: { accessToken: access, refreshToken: 'refresh-1' } },
+    ]);
+  });
+
+  test('opaque access tokens complete the login with no keychain save', async () => {
+    const h = createHarness({
+      serviceImpl: async () => h.serviceJson(200, SERVICE_PAIR),
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+    expect(h.tokenSaves).toHaveLength(0);
+  });
+
+  test('rejected logins and keyless pairs store nothing', async () => {
+    const denied = createHarness({
+      serviceImpl: async () => denied.serviceJson(401, { error: 'invalid_credentials' }),
+    });
+    const failed = await denied.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 'wrong' },
+    });
+    expect(failed.res.statusCode).toBe(401);
+    expect(denied.tokenSaves).toHaveLength(0);
+
+    const keyless = createHarness({
+      serviceImpl: async () => keyless.serviceJson(200, { refresh_token: 'only' }),
+    });
+    const rejected = await keyless.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 'x' },
+    });
+    expect(rejected.res.statusCode).toBe(502);
+    expect(keyless.tokenSaves).toHaveLength(0);
+  });
+
+  test('the service-verified path stores under the confirmed subject', async () => {
+    // The token's own sub claim disagrees with the service confirmation:
+    // the live introspection owns the key, never the unverified decode.
+    const access = jwtAccess('token-claim-sub');
+    const h = createHarness({
+      alcoreSecret: '',
+      serviceImpl: async (url) => {
+        if (url === 'https://auth.alcore.io.vn/auth/login') {
+          return h.serviceJson(200, { ...SERVICE_PAIR, access_token: access });
+        }
+        if (url === 'https://auth.alcore.io.vn/auth/me') {
+          return h.serviceJson(200, { id: 'user-7', email: 'a@example.test', emailVerified: true });
+        }
+        throw new Error(`unexpected service call ${url}`);
+      },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 'x' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(h.tokenSaves).toEqual([
+      { sub: 'user-7', pair: { accessToken: access, refreshToken: 'svc-refresh' } },
+    ]);
+  });
+
+  test('a failing store never fails the login', async () => {
+    const access = jwtAccess('user-1');
+    const h = createHarness({
+      serviceImpl: async () => h.serviceJson(200, { ...SERVICE_PAIR, access_token: access }),
+      userTokenStore: {
+        savePair: async () => { throw new Error('keychain locked'); },
+        readPair: async () => null,
+        clearPair: async () => {},
+        refreshAccessToken: async () => { throw new Error('refresh not stubbed'); },
+      },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
+  });
+
+  test('google completion keychains the exchanged pair', async () => {
+    const access = jwtAccess('user-1');
+    const seen = [];
+    const h = createHarness({
+      serviceImpl: async (url) => {
+        if (url.endsWith('/auth/google/config')) return okJson({ clientId: 'google-client-123' });
+        if (url.endsWith('/auth/me')) return okJson({ id: 'user-1', email: 'ada@example.test', emailVerified: true });
+        seen.push(url);
+        return okJson({ access_token: access, refresh_token: 'google-refresh-1' });
+      },
+    });
+    const started = await h.call('POST', '/api/auth/desktop/google/start', { body: {} });
+    expect(started.res.statusCode).toBe(200);
+    const { requestId } = started.res.body;
+    const landed = await h.call('GET', '/auth/desktop-google/callback', {
+      query: { state: requestId, code: 'loopback-code' },
+    });
+    expect(landed.res.statusCode).toBe(200);
+    const done = await h.call('POST', '/api/auth/desktop/google-complete', { body: { requestId } });
+    expect(done.res.statusCode).toBe(200);
+    // The refresh token crossed the loopback hop inside the server-held
+    // pending entry and lands keychained with the access token.
+    expect(h.tokenSaves).toEqual([
+      { sub: 'user-1', pair: { accessToken: access, refreshToken: 'google-refresh-1' } },
+    ]);
   });
 });
 

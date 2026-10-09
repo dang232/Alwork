@@ -8,15 +8,10 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Icon } from '@/components/icon/Icon';
 import { useI18n } from '@/lib/i18n';
-import { isDesktopShell, isVSCodeRuntime } from '@/lib/desktop';
-import {
-  desktopHostsGet,
-  desktopHostsSet,
-  getDesktopHostApiUrl,
-  normalizeHostUrl,
-} from '@/lib/desktopHosts';
+import { isVSCodeRuntime } from '@/lib/desktop';
 import { runtimeFetch } from '@/lib/runtime-fetch';
-import { getRuntimeApiBaseUrl, subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
+import { subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
+import { signOutToGate } from './signOutToGate';
 import { useAuthSessionStore } from '@/lib/runtime-auth-expiry';
 import { toast } from '@/components/ui';
 import { parseAccountSession, type AccountSession } from './accountSession';
@@ -26,56 +21,14 @@ import { quotaAvailableMajor, useAccountQuota } from './accountQuota';
 // skipped). Reads the existing desktop-auth session shape only:
 // GET /auth/session decides signed-in vs signed-out, and a corrupt or
 // expired answer renders the signed-out state — never a stuck loader.
-// Sign out uses the existing global sign-out route (POST /api/auth/reset,
-// which clears the session cookie) plus the existing desktop host storage
-// to drop this device's client credential, then reloads into the gate's
-// Sign-in screen. No auth semantics or token shapes change here.
+// Sign out runs the shared signOutToGate sequence (the existing global
+// sign-out route POST /api/auth/reset, which clears the session cookie,
+// plus the existing desktop host storage drop for this device's client
+// credential, then a reload into the gate's Sign-in screen). No auth
+// semantics or token shapes change here.
 //
 // Surfaces: web and Electron desktop show the profile; hosted and
 // Capacitor mobile inherit the same shared-UI behavior; VS Code hides it.
-
-const originOf = (raw: string | null | undefined): string => {
-  if (!raw) return '';
-  try {
-    return new URL(raw.trim()).origin;
-  } catch {
-    return '';
-  }
-};
-
-// Drop the credential the current endpoint authenticates with, so the
-// reload after sign-out cannot silently re-authenticate: the local
-// desktop token for a local endpoint, or the matching remote host token.
-const clearCurrentDesktopCredential = async (): Promise<void> => {
-  const cfg = await desktopHostsGet().catch(() => null);
-  if (!cfg) return;
-  const apiBase = getRuntimeApiBaseUrl();
-  if (cfg.localOrigin && originOf(cfg.localOrigin) !== '' && originOf(cfg.localOrigin) === originOf(apiBase)) {
-    await desktopHostsSet({
-      hosts: cfg.hosts,
-      defaultHostId: cfg.defaultHostId,
-      initialHostChoiceCompleted: cfg.initialHostChoiceCompleted,
-      localClientToken: '',
-    }).catch(() => undefined);
-    return;
-  }
-  const target = originOf(apiBase);
-  if (!target) return;
-  let changed = false;
-  const hosts = cfg.hosts.map((host) => {
-    if (!host.clientToken || originOf(getDesktopHostApiUrl(host)) !== target) return host;
-    changed = true;
-    const next = { ...host };
-    delete next.clientToken;
-    return next;
-  });
-  if (!changed) return;
-  await desktopHostsSet({
-    hosts,
-    defaultHostId: cfg.defaultHostId,
-    initialHostChoiceCompleted: cfg.initialHostChoiceCompleted,
-  }).catch(() => undefined);
-};
 
 const AccountAvatar: React.FC<{ displayName: string; avatarUrl: string; initials: string; size: 'sm' | 'lg' }> = ({
   displayName,
@@ -158,23 +111,11 @@ export const AccountProfile: React.FC = () => {
     if (signingOut) return;
     setSigningOut(true);
     try {
-      await runtimeFetch('/api/auth/reset', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { Accept: 'application/json' },
-      }).catch(() => null);
+      await signOutToGate();
     } catch {
-      // The credential clear below still signs this device out of bearer
-      // sessions; the reload lands on whatever the server answers with.
+      toast.error(t('sessionAuth.error.networkRetry'));
     }
-    try {
-      if (isDesktopShell()) await clearCurrentDesktopCredential();
-    } catch {
-      // Best-effort storage clear; the cookie reset above already ended the
-      // cookie session, so the reload still lands on the Sign-in screen.
-    }
-    window.location.reload();
-  }, [signingOut]);
+  }, [signingOut, t]);
 
   if (isVSCode) return null;
 

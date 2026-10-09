@@ -1,6 +1,8 @@
 import { registerFsRoutes } from '../fs/routes.js';
 import { registerEnvironmentRoutes } from '../environment/routes.js';
 import { registerQuotaRoutes } from '../quota/routes.js';
+import { createTokenpanelQuotaRuntime } from '../tokenpanel/tokenpanel-quota.js';
+import { sharedUserTokenStore } from '../user-tokens/user-token-store.js';
 import { registerSmallModelRoutes } from '../small-model/routes.js';
 import { registerWalkthroughRoutes } from '../walkthrough/routes.js';
 import { registerSessionGoalRoutes } from '../session-goal/routes.js';
@@ -174,6 +176,7 @@ export const createFeatureRoutesRuntime = (dependencies) => {
 
   const registerRoutes = async (app, routeDependencies) => {
     const {
+      uiAuthController,
       messageSearchRuntime,
       crypto,
       fs,
@@ -411,6 +414,14 @@ export const createFeatureRoutesRuntime = (dependencies) => {
     });
 
     registerQuotaRoutes(app, { getQuotaProviders });
+    // Behind the /api session gate (registered in bootstrap) and before the
+    // generic OpenCode proxy: the account panel's live TokenPanel quota read.
+    // The store is the desktop-login singleton (capture and presentation
+    // share one keychain); the subject resolver binds reads to the caller.
+    createTokenpanelQuotaRuntime({
+      userTokenStore: sharedUserTokenStore(),
+      resolveSubject: (req) => uiAuthController?.resolveRequestAlcoreSub?.(req) ?? '',
+    }).registerRoutes(app);
     registerSmallModelRoutes(app, { getSmallModelService });
     registerSessionGoalRoutes(app);
     const gitBinary = resolveGitBinaryForSpawn();

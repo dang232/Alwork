@@ -2,6 +2,7 @@ import { buildExternalManualRestartResponse } from './config-mutation-response.j
 import { ThemeImportStorageError } from './theme-runtime.js';
 import { registerThemeCatalogRoutes } from './theme-catalog.js';
 import { createDesktopAuthRuntime } from '../desktop-auth/desktop-auth.js';
+import { sharedUserTokenStore } from '../user-tokens/user-token-store.js';
 
 const parseLoopbackUrl = (rawUrl) => {
   if (typeof rawUrl !== 'string') {
@@ -684,6 +685,9 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     alcoreSecret,
     alcorePreviousSecret,
     alcoreIssuer,
+    // The quota proxy shares this instance: a pair captured at loopback
+    // completion is the pair the proxy presents.
+    userTokenStore: sharedUserTokenStore(),
   });
   desktopAuthRuntime.registerRoutes({
     get: (path, ...handlers) => app.get(path, ...handlers),

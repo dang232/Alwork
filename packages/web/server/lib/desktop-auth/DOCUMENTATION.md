@@ -41,7 +41,16 @@ JavaScript origin is ever involved. Google returns the authorization code to
 the loopback callback, which validates the minted state, redeems the code at
 the service's `POST /auth/google/desktop-code` endpoint (the confidential
 secret never leaves the service), and holds the resulting pair (5-minute
-TTL, single use). The app polls `/api/auth/desktop/google-complete`, which
+TTL, single use). The exchange answer also carries the signature-verified
+Google profile (`profile: { name?, picture? }`, which the service persists
+nowhere), so the callback captures it onto the pending entry — the only
+place the IDE ever sees the name/avatar. Email/OTP completions take the
+account email from the pair's user view instead (no extra call); the Google
+path reads it best-effort from `GET /auth/me` with the fresh pair (the
+user's own token, never stored; failures leave name/picture intact). At
+completion the server-held profile rides the session body into issuance,
+where the session owner re-validates and binds it — client poll bodies
+cannot mint profile fields. The app polls `/api/auth/desktop/google-complete`, which
 converts the pair into a session like email. The renderer never sees the
 code, verifier, or pair.
 
@@ -66,10 +75,23 @@ Completion requires proving the service pair: servers with the shared
 `uiAuthController.handleServiceVerifiedSessionCreate`. An unreachable or
 unconfirming service fails closed — never a session.
 
+Keychain capture (project-ide task 39): after a 200 issuance the proven
+pair (access JWT + rotating refresh token) is stored in the shared
+user-token keychain (`packages/web/server/lib/user-tokens/`), keyed by
+the verified subject — the JWT `sub` decode on the local-verify path
+(keying only; trust comes from the issuance above), the live-confirmed
+`sub` on the introspection path. The Google refresh token rides the
+server-held pending entry from the loopback callback into
+`google-complete` (never the browser, never the poll body). A locked or
+failing store never fails the proven login; nothing here logs tokens.
+Issuance, cookies, validation, and rate limits are untouched.
+
 ## Public exports (desktop-auth.js)
 
 - `createDesktopAuthRuntime({ uiAuthController, alcoreSecret,
-  alcorePreviousSecret, alcoreIssuer, authServiceBase, serviceFetch, now })`:
+  alcorePreviousSecret, alcoreIssuer, authServiceBase, serviceFetch, now,
+  userTokenStore })` (null disables capture; production passes the shared
+  keychain singleton):
   `{ registerRoutes, serviceBase }` plus `_pendingGoogle`/`_sweepGoogle` test
   seams. `serviceBase` derives from the Alcore issuer origin (default
   `https://auth.alcore.io.vn`); `serviceFetch` defaults to global fetch and is

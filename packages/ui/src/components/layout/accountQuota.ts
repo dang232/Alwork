@@ -2,6 +2,7 @@ import React from 'react';
 import { z } from 'zod';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
+import { clearAutoSignOutMark, signOutToGateOnce } from './signOutToGate';
 
 // Live TokenPanel quota beside the tier badge (task 35). The TokenPanel
 // quota read API owns usage/balance; this module only READS its shape over
@@ -15,7 +16,10 @@ import { subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
 // `stale-cached` (source cache, stale true), `unavailable` (any fetch
 // failure, non-200, or malformed body — never a blank crash, never a
 // fabricated quota). A missing subject means no identity to query, which
-// is also `unavailable`, not an error.
+// is also `unavailable`, not an error. The one exception is the proxy's
+// 401 `tokenpanel_session_expired` (the stored pair is dead and refresh
+// refused it): that signs out to the gate once via signOutToGate, then
+// reads `unavailable` like every other failure.
 
 const quotaBalanceSchema = z.object({
   amountMicros: z.number(),
@@ -79,13 +83,31 @@ export const quotaAvailableMajor = (balance: AccountQuotaBalance): number =>
 
 const QUOTA_REFRESH_MS = 3 * 60 * 1000;
 
-const readQuota = async (authUserId: string, signal: AbortSignal): Promise<AccountQuota> => {
+/** The proxy's TokenPanel-session-expired signal: refresh is dead, sign out. */
+const TOKENPANEL_SESSION_EXPIRED = 'tokenpanel_session_expired';
+
+/** 401 + the expired code — and only that — is the sign-out trigger. */
+export const isTokenpanelSessionExpired = (status: number, payload: AccountQuotaPayload): boolean => {
+  if (status !== 401) return false;
+  return z.object({ error: z.literal(TOKENPANEL_SESSION_EXPIRED) }).safeParse(payload).success;
+};
+
+export const fetchAccountQuota = async (authUserId: string, signal: AbortSignal): Promise<AccountQuota> => {
   if (authUserId === '') return { state: 'unavailable' };
   const response = await runtimeFetch(
     `/api/tokenpanel/quota?authUserId=${encodeURIComponent(authUserId)}`,
     { method: 'GET', credentials: 'include', headers: { Accept: 'application/json' }, signal },
   );
-  if (!response.ok) return { state: 'unavailable' };
+  if (!response.ok) {
+    if (isTokenpanelSessionExpired(response.status, await response.json().catch(() => null))) {
+      // The stored pair is dead and refresh refused it: leave the gate
+      // path — sign out once, then read as unavailable like every other
+      // failure (never a blank crash, never a fabricated quota).
+      await signOutToGateOnce();
+    }
+    return { state: 'unavailable' };
+  }
+  clearAutoSignOutMark();
   const payload = await response.json().catch(() => null);
   return parseAccountQuota(payload);
 };
@@ -107,7 +129,7 @@ export const useAccountQuota = (authUserId: string | null): AccountQuota | null 
     let settled = false;
     const controller = new AbortController();
     setQuota(null);
-    void readQuota(authUserId, controller.signal)
+    void fetchAccountQuota(authUserId, controller.signal)
       .then((next) => {
         if (!settled) setQuota(next);
       })
@@ -116,7 +138,7 @@ export const useAccountQuota = (authUserId: string | null): AccountQuota | null 
       });
     const timer = window.setInterval(() => {
       const refresh = new AbortController();
-      void readQuota(authUserId, refresh.signal)
+      void fetchAccountQuota(authUserId, refresh.signal)
         .then((next) => {
           if (!settled) setQuota(next);
         })
@@ -127,7 +149,7 @@ export const useAccountQuota = (authUserId: string | null): AccountQuota | null 
     const unsubscribe = subscribeRuntimeEndpointChanged(() => {
       if (settled) return;
       const retry = new AbortController();
-      void readQuota(authUserId, retry.signal)
+      void fetchAccountQuota(authUserId, retry.signal)
         .then((next) => {
           if (!settled) setQuota(next);
         })

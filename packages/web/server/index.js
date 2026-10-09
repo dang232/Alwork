@@ -2411,6 +2411,7 @@ async function main(options = {}) {
   });
 
   await featureRoutesRuntime.registerRoutes(app, {
+    uiAuthController,
     environmentStore,
     environmentRuntime,
     listConfiguredProjects,

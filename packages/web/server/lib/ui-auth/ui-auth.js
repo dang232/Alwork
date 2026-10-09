@@ -551,6 +551,54 @@ const serviceVerifiedIdentitySchema = z.object({
   sid: z.string(),
 });
 
+// Desktop-login profile read-through (project-ide task 36): the desktop
+// completion path (desktop-auth) captures the service-verified Google
+// profile + account email server-side and passes it in the session body.
+// It is bound here to the issued session (cookie token, and the desktop
+// client id when one is minted alongside) in a TTL-bounded in-memory map
+// so GET /auth/session can carry name/avatar/email. Validation, cookies,
+// JWTs, TTLs, rate limits, and client issuance are untouched: a missing or
+// malformed profile answers exactly the old shape, and entries expire with
+// the session that owns them. The sub link is always server-verified;
+// display fields arriving on the direct login path are bound to that same
+// verified sub, never a client-chosen identity.
+const sessionProfileNameField = z.string().trim().min(1).max(256);
+const sessionProfilePictureField = z.string().trim().min(1).max(2048).refine((url) => url.startsWith('https://'));
+const sessionProfileEmailField = z.string().trim().toLowerCase().email().max(254);
+const sessionProfileBodySchema = z.object({ profile: z.object({}).passthrough().optional() });
+const SESSION_PROFILE_MAX_KEYS = 2000;
+
+// Field-wise read of the login body profile: one malformed field drops
+// only itself, never the whole profile or the login.
+const readSessionProfile = (req) => {
+  const outer = sessionProfileBodySchema.safeParse(req?.body);
+  const holder = outer.success ? outer.data.profile : undefined;
+  if (holder === undefined) return null;
+  const record = {};
+  const name = z.object({ name: sessionProfileNameField.optional() }).safeParse(holder);
+  if (name.success && name.data.name !== undefined) record.name = name.data.name;
+  const picture = z.object({ picture: sessionProfilePictureField.optional() }).safeParse(holder);
+  if (picture.success && picture.data.picture !== undefined) record.picture = picture.data.picture;
+  const email = z.object({ email: sessionProfileEmailField.optional() }).safeParse(holder);
+  if (email.success && email.data.email !== undefined) record.email = email.data.email;
+  return Object.keys(record).length === 0 ? null : record;
+};
+
+const clientBindingSchema = z.object({
+  client: z.object({ id: z.string().min(1) }).passthrough().optional(),
+  clientId: z.string().min(1).optional(),
+  id: z.string().min(1).optional(),
+});
+
+// The status-time binding for an issued desktop client, derived exactly the
+// way clientSessionToken derives it when that client later authenticates.
+const clientBindingOf = (result) => {
+  const parsed = clientBindingSchema.safeParse(result);
+  if (!parsed.success) return null;
+  const id = parsed.data.client?.id ?? parsed.data.clientId ?? parsed.data.id ?? null;
+  return id === null ? null : `client:${id}`;
+};
+
 const readAlcoreLoginToken = (req) => {
   const body = alcoreLoginBodySchema.safeParse(req?.body).data;
   const candidates = [body?.alcoreToken, body?.accessToken, body?.token];
@@ -636,6 +684,47 @@ export const createUiAuth = ({
     }
   };
   const urlAuthTokens = new Map();
+  // Session -> login profile bindings (cookie token and desktop client id).
+  // Read-only enrichment for GET /auth/session; never consulted by any
+  // validation path.
+  const sessionProfiles = new Map();
+
+  const sweepSessionProfiles = (at) => {
+    for (const [binding, entry] of sessionProfiles) {
+      if (!entry || entry.expiresAt <= at) sessionProfiles.delete(binding);
+    }
+    while (sessionProfiles.size > SESSION_PROFILE_MAX_KEYS) {
+      const oldest = sessionProfiles.keys().next();
+      if (oldest.done) break;
+      sessionProfiles.delete(oldest.value);
+    }
+  };
+
+  const rememberSessionProfile = (bindings, record, ttlMs) => {
+    if (record === null || bindings.length === 0) return;
+    const at = Date.now();
+    sweepSessionProfiles(at);
+    const entry = { record, expiresAt: at + ttlMs };
+    for (const binding of bindings) sessionProfiles.set(binding, entry);
+  };
+
+  const readSessionProfileFor = (binding) => {
+    const entry = sessionProfiles.get(binding);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      sessionProfiles.delete(binding);
+      return null;
+    }
+    return entry.record;
+  };
+
+  const profileAlcoreOf = (record) => {
+    const alcore = { sub: record.sub };
+    if (record.email !== undefined) alcore.email = record.email;
+    if (record.name !== undefined) alcore.name = record.name;
+    if (record.picture !== undefined) alcore.picture = record.picture;
+    return alcore;
+  };
 
   const sweepUrlAuthTokens = () => {
     const now = Date.now();
@@ -862,6 +951,11 @@ export const createUiAuth = ({
       }
       const clientAuth = await authenticateClientRequest(req, { allowUrlToken: false });
       if (clientAuth) {
+        const bound = readSessionProfileFor(clientSessionToken(clientAuth));
+        if (bound !== null) {
+          res.json({ authenticated: true, scope: 'client', alcore: profileAlcoreOf(bound) });
+          return;
+        }
         res.json({ authenticated: true, scope: 'client' });
         return;
       }
@@ -870,11 +964,21 @@ export const createUiAuth = ({
     }
     const token = getTokenFromRequest(req);
     if (await isSessionValid(token)) {
+      const bound = readSessionProfileFor(token);
+      if (bound !== null) {
+        res.json({ authenticated: true, alcore: profileAlcoreOf(bound) });
+        return;
+      }
       res.json({ authenticated: true });
       return;
     }
     const clientAuth = await authenticateClientRequest(req);
     if (clientAuth) {
+      const bound = readSessionProfileFor(clientSessionToken(clientAuth));
+      if (bound !== null) {
+        res.json({ authenticated: true, scope: 'client', alcore: profileAlcoreOf(bound) });
+        return;
+      }
       res.json({ authenticated: true, scope: 'client' });
       return;
     }
@@ -895,6 +999,23 @@ export const createUiAuth = ({
     if (alcore) return alcoreSessionToken(alcore);
     const clientAuth = await authenticateClientRequest(req, { allowUrlToken });
     return clientAuth ? clientSessionToken(clientAuth) : null;
+  };
+
+  // Read-only subject for the caller's own Alcore identity: a Bearer
+  // Alcore token verifies to its sub; a cookie session reads the sub bound
+  // at issuance. Anything else answers ''. Mirrors exactly what
+  // handleSessionStatus reports, so the quota proxy's self-only check and
+  // the panel's subject agree. Additive: never consulted by validation,
+  // and issuance/cookies/TTLs are untouched.
+  const resolveRequestAlcoreSub = async (req) => {
+    const alcore = tryVerifyAlcore(getAlcoreTokenFromRequest(req));
+    if (alcore) return alcore.sub;
+    const token = getTokenFromRequest(req);
+    if (token && await isSessionValid(token)) {
+      const bound = readSessionProfileFor(token);
+      return z.string().safeParse(bound?.sub).data ?? '';
+    }
+    return '';
   };
 
   const resolveAuthContext = async (req, _res, { allowClientAuth = true, allowUrlToken = true } = {}) => {
@@ -953,13 +1074,15 @@ export const createUiAuth = ({
   // Shared issuance tail for verified Alcore identities: session cookie,
   // TTLs, and optional client tokens stay on this one path no matter how
   // the identity was verified (local HMAC above, service introspection in
-  // the desktop login below).
+  // the desktop login below). A login-time profile in the session body is
+  // bound to the issued session here (cookie token, plus the desktop client
+  // id when one is minted alongside) for the status read-through above.
   const issueVerifiedAlcoreSession = async (req, res, alcore) => {
     await clearRateLimit(req);
 
     const trustDevice = isTrustedDeviceRequest(req.body?.trustDevice);
     const ttlMs = resolveSessionTtlMs(trustDevice);
-    await issueSession(req, res, { trustDevice });
+    const sessionToken = await issueSession(req, res, { trustDevice });
     let clientTokenResult = null;
     if (req.body?.issueClientToken === true && typeof clientAuthController?.createClient === 'function') {
       clientTokenResult = await clientAuthController.createClient({
@@ -973,6 +1096,13 @@ export const createUiAuth = ({
         deviceModel: req.body?.deviceModel,
         appVersion: req.body?.appVersion,
       });
+    }
+    const loginProfile = readSessionProfile(req);
+    if (loginProfile !== null) {
+      const bindings = [sessionToken];
+      const clientBinding = clientBindingOf(clientTokenResult);
+      if (clientBinding !== null) bindings.push(clientBinding);
+      rememberSessionProfile(bindings, { sub: alcore.sub, ...loginProfile }, ttlMs);
     }
     res.setHeader('Cache-Control', 'no-store');
     res.json({
@@ -1106,6 +1236,7 @@ export const createUiAuth = ({
   const handleResetAuth = (req, res) => {
     try {
       const passkeyResult = passkeyController.clearAllPasskeys();
+      sessionProfiles.clear();
       rotateJwtSecret();
       clearSessionCookie(req, res);
       res.json({
@@ -1120,6 +1251,7 @@ export const createUiAuth = ({
 
   const dispose = () => {
     loginRateLimiter.clear();
+    sessionProfiles.clear();
     if (rateLimitCleanupTimer) {
       clearInterval(rateLimitCleanupTimer);
       rateLimitCleanupTimer = null;
@@ -1132,6 +1264,7 @@ export const createUiAuth = ({
     requireAuth,
     requireSessionAuth,
     resolveAuthContext,
+    resolveRequestAlcoreSub,
     handleSessionStatus,
     handleSessionCreate,
     handleServiceVerifiedSessionCreate,

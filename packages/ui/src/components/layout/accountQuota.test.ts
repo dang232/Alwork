@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { parseAccountQuota, quotaAvailableMajor } from './accountQuota';
+import { clearAutoSignOutMark } from './signOutToGate';
+import {
+  fetchAccountQuota,
+  isTokenpanelSessionExpired,
+  parseAccountQuota,
+  quotaAvailableMajor,
+  type AccountQuotaPayload,
+} from './accountQuota';
 
 // Focused coverage for the header quota states beside the tier badge.
 // The parser only READS the TokenPanel quota shape: live vs stale-cached
@@ -42,5 +49,133 @@ describe('parseAccountQuota', () => {
 
   test('missing subject means no query — callers map it to unavailable', () => {
     expect(''.length).toBe(0);
+  });
+});
+
+describe('isTokenpanelSessionExpired', () => {
+  test('only the 401 expired code triggers sign-out', () => {
+    expect(isTokenpanelSessionExpired(401, { error: 'tokenpanel_session_expired' })).toBe(true);
+    const cases: Array<[number, AccountQuotaPayload]> = [
+      [401, { error: 'tokenpanel_forbidden' }],
+      [401, { error: 'tokenpanel_unavailable' }],
+      [401, {}],
+      [401, null],
+      [401, 'expired'],
+      [401, []],
+      [503, { error: 'tokenpanel_session_expired' }],
+      [200, { error: 'tokenpanel_session_expired' }],
+    ];
+    for (const [status, payload] of cases) {
+      expect(isTokenpanelSessionExpired(status, payload)).toBe(false);
+    }
+  });
+});
+
+describe('fetchAccountQuota sign-out chain', () => {
+  // SAFETY: the stub installs a plain-object window below and this file
+  // restores the original value after each test; only presence is read here.
+  const originalWindow = (globalThis as { window?: unknown }).window;
+  const originalFetch = globalThis.fetch;
+
+  const installWindow = (fetchImpl: (input: string) => Promise<Response>) => {
+    const requests: string[] = [];
+    const session = new Map<string, string>();
+    let reloads = 0;
+    // SAFETY: fetchAccountQuota only calls fetch(input, init); Bun's extra
+    // `preconnect` member is never read.
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(`${init?.method ?? 'GET'} ${String(input)}`);
+      return fetchImpl(String(input));
+    }) as typeof fetch;
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: {
+        location: {
+          origin: 'http://127.0.0.1:3001',
+          href: 'http://127.0.0.1:3001/',
+          protocol: 'http:',
+          reload: () => {
+            reloads += 1;
+          },
+        },
+        sessionStorage: {
+          getItem: (key: string) => session.get(key) ?? null,
+          setItem: (key: string, value: string) => {
+            session.set(key, value);
+          },
+          removeItem: (key: string) => {
+            session.delete(key);
+          },
+        },
+      },
+    });
+    return {
+      requests,
+      reloads: () => reloads,
+      restore: () => {
+        globalThis.fetch = originalFetch;
+        Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+      },
+    };
+  };
+
+  const json = (status: number, data: AccountQuotaPayload) =>
+    new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+
+  test('live reads stay signed in and re-arm the guard', async () => {
+    const w = installWindow(async () => json(200, liveBody));
+    try {
+      clearAutoSignOutMark();
+      const quota = await fetchAccountQuota('auth_user_1', new AbortController().signal);
+      expect(quota).toMatchObject({ state: 'live' });
+      expect(w.requests.some((entry) => entry.includes('/api/tokenpanel/quota'))).toBe(true);
+      expect(w.requests.some((entry) => entry.includes('/api/auth/reset'))).toBe(false);
+      expect(w.reloads()).toBe(0);
+    } finally {
+      w.restore();
+    }
+  });
+
+  test('session-expiry signs out once, then reads unavailable', async () => {
+    const w = installWindow(async (input) => {
+      if (input.includes('/api/auth/reset')) return json(200, {});
+      return json(401, { error: 'tokenpanel_session_expired' });
+    });
+    try {
+      clearAutoSignOutMark();
+      const first = await fetchAccountQuota('auth_user_1', new AbortController().signal);
+      expect(first).toEqual({ state: 'unavailable' });
+      const second = await fetchAccountQuota('auth_user_1', new AbortController().signal);
+      expect(second).toEqual({ state: 'unavailable' });
+      expect(w.requests.filter((entry) => entry.includes('/api/auth/reset'))).toHaveLength(1);
+      expect(w.reloads()).toBe(1);
+    } finally {
+      w.restore();
+    }
+  });
+
+  test('other failures stay unavailable without signing out', async () => {
+    const w = installWindow(async () => json(503, { error: 'tokenpanel_unavailable' }));
+    try {
+      clearAutoSignOutMark();
+      expect(await fetchAccountQuota('auth_user_1', new AbortController().signal)).toEqual({
+        state: 'unavailable',
+      });
+      expect(w.requests.some((entry) => entry.includes('/api/auth/reset'))).toBe(false);
+      expect(w.reloads()).toBe(0);
+    } finally {
+      w.restore();
+    }
+  });
+
+  test('empty subject never reaches the network', async () => {
+    const w = installWindow(async () => json(200, liveBody));
+    try {
+      clearAutoSignOutMark();
+      expect(await fetchAccountQuota('', new AbortController().signal)).toEqual({ state: 'unavailable' });
+      expect(w.requests).toHaveLength(0);
+    } finally {
+      w.restore();
+    }
   });
 });

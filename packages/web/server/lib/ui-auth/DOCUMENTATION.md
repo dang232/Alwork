@@ -21,6 +21,30 @@ Browsers key a cookie jar on the host only, never the port (RFC 6265). Two OpenC
 
 Compatibility: upgrading renames the cookie for any explicit-port host, so already-signed-in browser sessions must log in once again. No on-disk format changes.
 
+## Session profile read-through
+
+A login-time `profile` in the session body (`{ name?, picture?, email? }`,
+passed by the desktop completion path) is bound to the issued session —
+the cookie token, plus the desktop client id when one is minted alongside
+— in a TTL-bounded in-memory map (2000 keys max, swept on write, expired
+with the owning session, cleared on global sign-out and dispose). `GET
+/auth/session` then carries `alcore: { sub, name?, picture?, email? }` on
+cookie and client sessions, which the header account surface parses; every
+other shape is byte-identical to before. Validation, cookies, JWTs, TTLs,
+rate limits, and client issuance are untouched: a missing or malformed
+profile answers exactly the old shape. The sub link is always
+server-verified; display fields are bound to that verified sub.
+
+## Request subject seam
+
+`resolveRequestAlcoreSub(req)` answers the caller's own Alcore `sub`
+for the TokenPanel quota proxy's self-only check: a Bearer Alcore token
+verifies to its sub; a cookie session reads the sub bound at issuance;
+anything else answers `''`. It mirrors exactly what `GET /auth/session`
+reports, so the proxy and the panel's subject agree. Read-only and
+additive — never consulted by validation, and issuance/cookies/TTLs are
+untouched.
+
 ## Public exports (ui-auth.js)
 - `readSessionTtlMs(raw, unitMs, fallbackMs)`: parses a positive session lifetime from an environment value, else the fallback. Defaults come from `OPENCHAMBER_UI_SESSION_TTL_HOURS` (12) and `OPENCHAMBER_UI_TRUSTED_SESSION_TTL_DAYS` (7, used when the user ticks "trust this device").
 - `createUiAuth({ password, cookieName, sessionTtlMs, trustedSessionTtlMs, readSettingsFromDiskMigrated })`: creates UI auth controller with methods:
@@ -36,6 +60,7 @@ Compatibility: upgrading renames the cookie for any explicit-port host, so alrea
   - `handlePasskeyList(req, res)`
   - `handlePasskeyRevoke(req, res)`
   - `handleResetAuth(req, res)`
+  - `resolveRequestAlcoreSub(req)`
   - `ensureSessionToken(req, res)`
   - `dispose()`
 

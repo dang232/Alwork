@@ -69,12 +69,71 @@ const requestIdSchema = z.string().regex(/^[0-9a-f]{32}$/);
 const nonEmptyStringSchema = z.string().min(1);
 // Service and browser payloads are parsed with these schemas at their
 // boundaries instead of ad-hoc type narrowing.
-const servicePairSchema = z.object({ access_token: nonEmptyStringSchema });
+const servicePairSchema = z.object({
+  access_token: nonEmptyStringSchema,
+  // The rotating refresh token the auth-service returns beside the access
+  // JWT (absent until its track lands): captured to the keychain with the
+  // access token, never required for the login itself.
+  refresh_token: z.string().trim().min(1).max(4096).optional(),
+});
 // Upstream error codes are named, not free text: only codes matching the
 // service's own machine-code shape pass through to the failure page.
 const serviceErrorSchema = z.object({ error: z.string().regex(/^[A-Za-z0-9_]{1,64}$/) });
 const serviceMeSchema = z.object({ id: nonEmptyStringSchema });
+// Verified identity extras the IDE session can carry without touching
+// issuance: the Google exchange profile (signature-verified name/picture
+// the auth-service hands to the completing client once and persists
+// nowhere) plus the account email (pair user view, or best-effort
+// GET /auth/me with the fresh pair). Bounds mirror the service so a
+// malformed value drops its field instead of forging a profile.
+const profileNameField = z.string().trim().min(1).max(256);
+const profilePictureField = z.string().trim().min(1).max(2048).refine((url) => url.startsWith('https://'));
+const profileEmailField = z.string().trim().toLowerCase().email().max(254);
+const completionProfileSchema = z.object({
+  name: profileNameField.optional(),
+  picture: profilePictureField.optional(),
+  email: profileEmailField.optional(),
+});
+const exchangeProfileSchema = z.object({
+  profile: z.record(z.string(), z.unknown()).optional(),
+});
+const pairUserSchema = z.object({
+  user: z.object({
+    email: profileEmailField,
+  }).optional(),
+});
+const meEmailSchema = z.object({
+  email: profileEmailField,
+});
+
+// Field-wise capture of the exchange profile: one malformed field drops
+// only itself, never the whole profile or the login.
+const captureExchangeProfile = (exchangeData) => {
+  const outer = exchangeProfileSchema.safeParse(exchangeData);
+  const holder = outer.success ? outer.data.profile : undefined;
+  if (holder === undefined) return null;
+  const profile = {};
+  const name = z.object({ name: profileNameField.optional() }).safeParse(holder);
+  if (name.success && name.data.name !== undefined) profile.name = name.data.name;
+  const picture = z.object({ picture: profilePictureField.optional() }).safeParse(holder);
+  if (picture.success && picture.data.picture !== undefined) profile.picture = picture.data.picture;
+  return Object.keys(profile).length === 0 ? null : profile;
+};
+
+const readPairEmail = (pair) => {
+  const parsed = pairUserSchema.safeParse(pair);
+  return parsed.success ? parsed.data.user?.email ?? '' : '';
+};
+
+const mergeCompletionProfile = (completionProfile, email) => {
+  const merged = {};
+  if (completionProfile?.name !== undefined) merged.name = completionProfile.name;
+  if (completionProfile?.picture !== undefined) merged.picture = completionProfile.picture;
+  if (email !== '') merged.email = email;
+  return Object.keys(merged).length === 0 ? null : merged;
+};
 const tokenSidSchema = z.object({ sid: z.string() });
+const tokenSubSchema = z.object({ sub: z.string() });
 const desktopCallbackQuerySchema = z.object({
   state: z.string(),
   code: z.string().optional(),
@@ -126,6 +185,9 @@ export const createDesktopAuthRuntime = ({
   authServiceBase,
   serviceFetch = (...args) => fetch(...args),
   now = () => Date.now(),
+  // Shared keychain store (production wiring passes the singleton; tests
+  // inject a recording fake). Null disables capture without touching login.
+  userTokenStore = null,
 } = {}) => {
   const serviceBase = resolveServiceBase(authServiceBase);
   const pendingGoogle = new Map();
@@ -188,18 +250,71 @@ export const createDesktopAuthRuntime = ({
     return res.status(status).json({ error: fallback });
   };
 
+  // Best-effort account email for the local-verify path: Email/OTP pairs
+  // already carry the verified user view, but Google pairs do not, so one
+  // GET /auth/me with the fresh pair (the user's own token, keychained
+  // only through captureUserTokens after issuance) fills it. Any failure
+  // leaves name/picture intact — email is enrichment, never a login gate.
+  const readServiceEmail = async (token) => {
+    try {
+      const response = await serviceFetch(`${serviceBase}/auth/me`, {
+        method: 'GET',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(SERVICE_TIMEOUT_MS),
+      });
+      if (response.status !== 200) return '';
+      const parsed = meEmailSchema.safeParse(await response.json().catch(() => null));
+      return parsed.success ? parsed.data.email : '';
+    } catch {
+      return '';
+    }
+  };
+
   // Convert a service session pair into an IDE UI session through the one
   // login path that owns cookies, TTLs, and client tokens. Fails closed when
   // this server could not verify Alcore tokens (no shared secret configured).
-  const completeWithServicePair = async (req, res, pair, sessionOpts) => {
+  // `completionProfile` is server-held data only (the captured exchange
+  // profile, never client input): it rides the session body into issuance,
+  // where the session owner re-validates and binds it. Issuance, cookies,
+  // and validation are untouched.
+  // Keychain capture at loopback completion: stores the pair the login
+  // just proved, keyed by the verified subject, so the TokenPanel quota
+  // proxy can present the caller's own Bearer later. Never breaks the
+  // login it follows: an unkeyable subject, a non-200 issuance, or a
+  // failing store resolves silently, and nothing here logs the tokens.
+  const captureUserTokens = async (sub, accessToken, refreshToken, res) => {
+    try {
+      if (userTokenStore === null || userTokenStore === undefined) return;
+      if (res?.statusCode !== 200) return;
+      const id = z.string().trim().min(1).safeParse(sub).data ?? '';
+      const access = String(accessToken ?? '').trim();
+      if (id === '' || access === '') return;
+      await userTokenStore.savePair(id, { accessToken: access, refreshToken });
+    } catch {
+      // Storage failure must not fail a proven login.
+    }
+  };
+
+  const completeWithServicePair = async (req, res, pair, sessionOpts, completionProfile = null) => {
     const parsedPair = servicePairSchema.safeParse(pair);
     const token = parsedPair.success ? parsedPair.data.access_token.trim() : '';
+    const refreshToken = parsedPair.success ? (parsedPair.data.refresh_token ?? '') : '';
     if (token === '') {
       return res.status(502).json({ error: 'unavailable' });
     }
     if (hasAlcoreSecret()) {
-      req.body = sessionBodyOf(sessionOpts, { alcoreToken: token });
-      return uiAuthController.handleSessionCreate(req, res);
+      const pairEmail = readPairEmail(pair);
+      const email = pairEmail === '' ? await readServiceEmail(token) : pairEmail;
+      const profile = mergeCompletionProfile(completionProfile, email);
+      const sessionExtra = { alcoreToken: token };
+      if (profile !== null) sessionExtra.profile = profile;
+      req.body = sessionBodyOf(sessionOpts, sessionExtra);
+      await uiAuthController.handleSessionCreate(req, res);
+      // The session owner just verified this pair (local HMAC): the decode
+      // below is keying only — trust comes from the 200 above, and the
+      // unverified sub never gates anything.
+      await captureUserTokens(decodeAccessTokenSub(token), token, refreshToken, res);
+      return;
     }
     // Packaged desktop: no shared secret is available (and none is shipped
     // in the app), so the pair is confirmed live against the service itself
@@ -212,8 +327,14 @@ export const createDesktopAuthRuntime = ({
     if (!confirmed || confirmed.sid === '') {
       return res.status(502).json({ error: 'unavailable' });
     }
-    req.body = sessionBodyOf(sessionOpts, {});
-    return uiAuthController.handleServiceVerifiedSessionCreate(req, res, confirmed);
+    const profile = mergeCompletionProfile(completionProfile, confirmed.email);
+    const sessionExtra = {};
+    if (profile !== null) sessionExtra.profile = profile;
+    req.body = sessionBodyOf(sessionOpts, sessionExtra);
+    await uiAuthController.handleServiceVerifiedSessionCreate(req, res, { sub: confirmed.sub, sid: confirmed.sid });
+    // The subject here was confirmed live against the service itself.
+    await captureUserTokens(confirmed.sub, token, refreshToken, res);
+    return;
   };
 
   // Session login body: optional flags are added only when present, so an
@@ -228,7 +349,9 @@ export const createDesktopAuthRuntime = ({
   // GET /auth/me token introspection: proves the service pair is live and
   // yields the authoritative subject. The sid rides along unverified from
   // the token payload (informational, for the session response); trust comes
-  // from the service's 200, not from local parsing.
+  // from the service's 200, not from local parsing. The account email rides
+  // along the same way when the user view carries one (best-effort profile
+  // enrichment, never a gate).
   const introspectServicePair = async (token) => {
     try {
       const response = await serviceFetch(`${serviceBase}/auth/me`, {
@@ -240,9 +363,22 @@ export const createDesktopAuthRuntime = ({
       const parsedMe = serviceMeSchema.safeParse(data);
       const sub = parsedMe.success ? parsedMe.data.id.trim() : '';
       if (response.status !== 200 || sub === '') return null;
-      return { sub, sid: decodeAccessTokenSid(token) };
+      const parsedEmail = meEmailSchema.safeParse(data);
+      return { sub, sid: decodeAccessTokenSid(token), email: parsedEmail.success ? parsedEmail.data.email : '' };
     } catch {
       return null;
+    }
+  };
+
+  // Unverified subject decode for keychain keying only (see
+  // captureUserTokens): trust comes from issuance, never this parse.
+  const decodeAccessTokenSub = (token) => {
+    try {
+      const payload = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+      const parsedSub = tokenSubSchema.safeParse(payload);
+      return parsedSub.success ? parsedSub.data.sub.trim() : '';
+    } catch {
+      return '';
     }
   };
 
@@ -429,15 +565,22 @@ ${detailLine}
       pending.failure = { step: 'exchange', code: 'upstream_unavailable', status: 502, detail: '' };
       return fail(502, pending.failure);
     }
-    const parsedToken = exchange.status === 200
+    const parsedPair = exchange.status === 200
       ? servicePairSchema.safeParse(exchange.data)
       : null;
-    const accessToken = parsedToken && parsedToken.success ? parsedToken.data.access_token.trim() : '';
+    const accessToken = parsedPair && parsedPair.success ? parsedPair.data.access_token.trim() : '';
     if (accessToken === '') {
       pending.failure = exchangeFailureOf(exchange);
       return fail(pending.failure.status, pending.failure);
     }
     pending.pair = accessToken;
+    // The loopback completion must carry BOTH tokens: the refresh token
+    // rides the server-held pending entry (never the browser, never the
+    // poll body) into google-complete, where capture keychains it.
+    pending.refreshToken = parsedPair.success ? (parsedPair.data.refresh_token ?? '') : '';
+    // The completion payload carries the signature-verified Google profile
+    // once; capture it here or the IDE session never learns the name/avatar.
+    pending.profile = captureExchangeProfile(exchange.data);
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(callbackSuccessPage());
@@ -538,6 +681,8 @@ ${detailLine}
         nonce,
         redirectUri,
         pair: null,
+        refreshToken: '',
+        profile: null,
         failure: null,
         expiresAt: now() + GOOGLE_REQUEST_TTL_MS,
       });
@@ -578,9 +723,18 @@ ${detailLine}
         // the loopback callback is about to present.
         return res.status(404).json({ error: 'no_credential' });
       }
-      // Single-use: consume before issuing so a replay races nothing.
+      // Single-use: consume before issuing so a replay races nothing. The
+      // captured exchange profile and refresh token are server-held (never
+      // client input) and ride into issuance, where the session owner
+      // binds the profile and the keychain capture takes the pair.
+      const completionProfile = pending.profile ?? null;
+      const completionPair = { access_token: parsedPair.data.access_token.trim() };
+      const pendingRefresh = z.string().trim().min(1).safeParse(pending.refreshToken).data;
+      if (pendingRefresh !== undefined) {
+        completionPair.refresh_token = pendingRefresh;
+      }
       pendingGoogle.delete(parsed.data.requestId);
-      return completeWithServicePair(req, res, { access_token: parsedPair.data.access_token.trim() }, sessionOptsOf(parsed.data));
+      return completeWithServicePair(req, res, completionPair, sessionOptsOf(parsed.data), completionProfile);
     });
   };
 

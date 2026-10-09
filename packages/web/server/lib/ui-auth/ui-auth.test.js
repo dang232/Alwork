@@ -496,6 +496,159 @@ describe('ui auth service-verified session seam', () => {
   });
 });
 
+describe('ui auth session profile read-through', () => {
+  const loginRes = async (auth, body) => {
+    const res = createResponse();
+    await auth.handleSessionCreate({ method: 'POST', headers: {}, body }, res);
+    return res;
+  };
+
+  const cookieOf = (res) => String(res.getHeader('set-cookie') || '').split(';', 1)[0];
+
+  const statusRes = async (auth, headers) => {
+    const res = createResponse();
+    await auth.handleSessionStatus({ method: 'GET', headers }, res);
+    return res;
+  };
+
+  const PROFILE = { name: 'Ada Lovelace', picture: 'https://example.test/ada.png', email: 'ada@example.test' };
+
+  it('carries the login profile on the cookie session status', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    const issued = await loginRes(auth, { alcoreToken: mintAlcoreToken({ sub: 'user-9' }), profile: PROFILE });
+    expect(issued.statusCode).toBe(200);
+    expect(issued.body).toMatchObject({ authenticated: true, alcore: { sub: 'user-9', sid: 'sess-1' } });
+
+    const status = await statusRes(auth, { cookie: cookieOf(issued) });
+    expect(status.body).toEqual({
+      authenticated: true,
+      alcore: { sub: 'user-9', email: 'ada@example.test', name: 'Ada Lovelace', picture: 'https://example.test/ada.png' },
+    });
+  });
+
+  it('answers the old shape when no profile was bound', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    const issued = await loginRes(auth, { alcoreToken: mintAlcoreToken() });
+    expect(issued.statusCode).toBe(200);
+
+    const status = await statusRes(auth, { cookie: cookieOf(issued) });
+    expect(status.body).toEqual({ authenticated: true });
+  });
+
+  it('ignores malformed profiles without touching issuance', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    for (const profile of [
+      42,
+      'ada',
+      {},
+      { name: '', picture: 'http://plain.test/ada.png', email: 'not-an-email' },
+      { name: 'x'.repeat(300) },
+    ]) {
+      const issued = await loginRes(auth, { alcoreToken: mintAlcoreToken(), profile });
+      expect(issued.statusCode).toBe(200);
+      const status = await statusRes(auth, { cookie: cookieOf(issued) });
+      expect(status.body).toEqual({ authenticated: true });
+    }
+  });
+
+  it('binds a partial profile field-wise', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    const issued = await loginRes(auth, {
+      alcoreToken: mintAlcoreToken({ sub: 'user-9' }),
+      profile: { name: 'Ada', picture: 'http://plain.test/ada.png' },
+    });
+    expect(issued.statusCode).toBe(200);
+    const status = await statusRes(auth, { cookie: cookieOf(issued) });
+    expect(status.body).toEqual({ authenticated: true, alcore: { sub: 'user-9', name: 'Ada' } });
+  });
+
+  it('carries the profile on the desktop client token status', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
+      clientAuthController: {
+        createClient: async () => ({ token: 'oc_client_profile', client: { id: 'device-9' } }),
+        authenticateBearerToken: async (token) => token === 'oc_client_profile' ? { ok: true, clientId: 'device-9' } : null,
+      },
+    });
+    const issued = await loginRes(auth, {
+      alcoreToken: mintAlcoreToken({ sub: 'user-9' }),
+      issueClientToken: true,
+      clientLabel: 'OpenChamber Desktop',
+      profile: PROFILE,
+    });
+    expect(issued.statusCode).toBe(200);
+    expect(issued.body.clientToken).toBe('oc_client_profile');
+
+    const status = await statusRes(auth, { authorization: 'Bearer oc_client_profile' });
+    expect(status.body).toEqual({
+      authenticated: true,
+      scope: 'client',
+      alcore: { sub: 'user-9', email: 'ada@example.test', name: 'Ada Lovelace', picture: 'https://example.test/ada.png' },
+    });
+  });
+
+  it('keeps the client status shape when no profile was bound', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({
+      alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER,
+      clientAuthController: {
+        authenticateBearerToken: async (token) => token === 'client-token' ? { ok: true, clientId: 'device-1' } : null,
+      },
+    });
+    const status = await statusRes(auth, { authorization: 'Bearer client-token' });
+    expect(status.body).toEqual({ authenticated: true, scope: 'client' });
+  });
+});
+
+describe('ui auth request subject seam', () => {
+  const loginRes = async (auth, body) => {
+    const res = createResponse();
+    await auth.handleSessionCreate({ method: 'POST', headers: {}, body }, res);
+    return res;
+  };
+
+  const cookieOf = (res) => String(res.getHeader('set-cookie') || '').split(';', 1)[0];
+
+  it('reads the sub from a Bearer Alcore token with no session', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    const token = mintAlcoreToken({ sub: 'user-9' });
+    expect(await auth.resolveRequestAlcoreSub({ method: 'GET', headers: { authorization: `Bearer ${token}` } })).toBe('user-9');
+  });
+
+  it('reads the sub bound to a cookie session at issuance', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    const issued = await loginRes(auth, {
+      alcoreToken: mintAlcoreToken({ sub: 'user-9' }),
+      profile: { email: 'ada@example.test' },
+    });
+    expect(issued.statusCode).toBe(200);
+    expect(await auth.resolveRequestAlcoreSub({ method: 'GET', headers: { cookie: cookieOf(issued) } })).toBe('user-9');
+  });
+
+  it('answers empty for unbound sessions and unauthenticated requests', async () => {
+    const createUiAuth = await loadCreateUiAuth();
+    const auth = createUiAuth({ alcoreSecret: ALCORE_TEST_SECRET, alcoreIssuer: ALCORE_TEST_ISSUER });
+    // A login with no profile binds nothing: the old status shape holds.
+    const issued = await loginRes(auth, { alcoreToken: mintAlcoreToken() });
+    expect(issued.statusCode).toBe(200);
+    expect(await auth.resolveRequestAlcoreSub({ method: 'GET', headers: { cookie: cookieOf(issued) } })).toBe('');
+    expect(await auth.resolveRequestAlcoreSub({ method: 'GET', headers: {} })).toBe('');
+    expect(await auth.resolveRequestAlcoreSub({
+      method: 'GET', headers: { authorization: 'Bearer bogus' },
+    })).toBe('');
+    expect(await auth.resolveRequestAlcoreSub({
+      method: 'GET', headers: { authorization: 'Bearer oc_client_device-1' },
+    })).toBe('');
+  });
+});
+
 // issue #2377: browsers key cookie jars on host only, so two instances on one
 // LAN IP (different ports) collided on `oc_ui_session`. Cookies are now scoped
 // by the request port so each instance owns its own slot.
