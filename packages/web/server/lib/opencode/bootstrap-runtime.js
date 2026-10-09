@@ -1,5 +1,6 @@
+import { OpenCode } from '@opencode/client';
 import { registerNotificationEmitRoutes } from '../notifications/emit-route.js';
-import { createAlcoreProviderRuntime } from '../alcore-provider/alcore-provider.js';
+import { ALCORE_PROVIDER_ID, createAlcoreProviderRuntime } from '../alcore-provider/alcore-provider.js';
 import { upsertProviderConfig, removeProviderConfig } from './providers.js';
 import { sharedUserTokenStore } from '../user-tokens/user-token-store.js';
 
@@ -73,6 +74,13 @@ export const createBootstrapRuntime = (dependencies) => {
       pluginNotificationEmitter,
       desktopUpdater,
       skipBodyParsing,
+      // OpenCode credential provisioning for the Alcore badge flip.
+      // Optional (tests + runtimes without a managed OpenCode omit them):
+      // without both, the provider block still registers but no OpenCode
+      // credential is stored. Read per call — the port and server password
+      // both move across an OpenCode restart.
+      buildOpenCodeUrl = null,
+      getOpenCodeAuthHeaders = null,
     } = options;
 
     const uiAuthController = createUiAuth({
@@ -115,10 +123,46 @@ export const createBootstrapRuntime = (dependencies) => {
     // The Alcore provider card shares the desktop-login keychain: a pair
     // captured at loopback completion is the pair the catalog sync
     // presents, and global sign-out clears it beside the provider entry.
+    // The OpenCode credential is the SAME caller Bearer (never a service
+    // key): stored via `integration.connect.key` so the card reads
+    // Connected, removed on sign-out so no orphan survives. Unwired (no
+    // OpenCode URL/auth) keeps the task-42 block-only behavior.
+    const openCodeWired = buildOpenCodeUrl !== null && buildOpenCodeUrl !== undefined
+      && getOpenCodeAuthHeaders !== null && getOpenCodeAuthHeaders !== undefined;
+    const openCodeCredentials = openCodeWired
+      ? {
+        listCredentialIDs: async () => {
+          const client = OpenCode.make({
+            baseUrl: buildOpenCodeUrl('', '').replace(/\/+$/, ''),
+            headers: { ...getOpenCodeAuthHeaders() },
+          });
+          const { data } = await client.integration.list();
+          const integration = data.find((entry) => entry?.id === ALCORE_PROVIDER_ID);
+          return (integration?.connections ?? [])
+            .filter((connection) => connection?.type === 'credential')
+            .map((connection) => connection.id);
+        },
+        connectKey: async (key) => {
+          const client = OpenCode.make({
+            baseUrl: buildOpenCodeUrl('', '').replace(/\/+$/, ''),
+            headers: { ...getOpenCodeAuthHeaders() },
+          });
+          await client.integration.connect.key({ integrationID: ALCORE_PROVIDER_ID, key });
+        },
+        removeCredential: async (credentialID) => {
+          const client = OpenCode.make({
+            baseUrl: buildOpenCodeUrl('', '').replace(/\/+$/, ''),
+            headers: { ...getOpenCodeAuthHeaders() },
+          });
+          await client.credential.remove({ credentialID });
+        },
+      }
+      : null;
     const alcoreProvider = createAlcoreProviderRuntime({
       userTokenStore: sharedUserTokenStore(),
       upsertProviderConfig,
       removeProviderConfig,
+      openCodeCredentials,
     });
 
     const authAndAccessRoutes = registerAuthAndAccessRoutes(app, {

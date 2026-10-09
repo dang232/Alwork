@@ -2301,6 +2301,11 @@ async function main(options = {}) {
     agentToolRuntime,
     desktopUpdater,
     skipBodyParsing: (req) => spacesHost?.skipsBodyParsing(req) === true,
+    // Alcore badge flip (task 48): the provider runtime stores the caller's
+    // own keychained Bearer as the OpenCode `alcore` credential on login
+    // and removes it on sign-out. Read per call — port/password move.
+    buildOpenCodeUrl,
+    getOpenCodeAuthHeaders,
   });
   uiAuthController = bootstrapResult.uiAuthController;
   // After the API auth gate, before every route that reads a directory, before the OpenCode proxy.

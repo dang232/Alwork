@@ -1,14 +1,30 @@
-// Alcore model provider sync (project-ide task 42).
+// Alcore model provider sync (project-ide tasks 42, 48).
 //
 // What this owns: the `alcore` OpenCode provider entry that appears in
-// Settings > Providers after an Alcore login. On login it reads the
-// CALLER's own keychained pair (see
+// Settings > Providers after an Alcore login, plus the OpenCode
+// credential that flips its card from "Not signed in" to "Connected".
+// On login it reads the CALLER's own keychained pair (see
 // `packages/web/server/lib/user-tokens/user-token-store.js`), fetches the
-// live model catalog from the platform with that Bearer, and writes the
+// live model catalog from the platform with that Bearer, writes the
 // provider block into the OpenCode user config through the same
 // `upsertProviderConfig` registry the Settings form uses — no parallel
-// provider system. On global sign-out it removes the entry, clears the
-// pair, and drops the ambient credential, so nothing is orphaned.
+// provider system — and stores that SAME caller Bearer as the integration
+// credential (`POST /api/integration/alcore/connect/key`, the exact path
+// the Settings custom-provider form uses after its config write). On
+// global sign-out it removes the OpenCode credential(s), the config entry,
+// clears the pair, and drops the ambient credential, so nothing is orphaned.
+//
+// Badge contract (OpenCode-chat state, read — never guessed):
+// `packages/ui/src/components/sections/providers/providerAuth.ts`
+// `getProviderCardStatus` returns `signInNeeded` ("Not signed in") when
+// the `alcore` integration exists with zero credential/env connections,
+// and `connected` once exactly one `type: 'credential'` connection exists
+// (or an inline `options.apiKey`). The integration list (`GET
+// /api/integration`) and the credential store (`GET /api/credential`,
+// owned by OpenCode since 2.0.20) are the only authority — there is no
+// `auth.json` anymore. A custom provider registers its key method only
+// once its block is in config, so the key follows the config write with
+// the same not-found retry the Settings form uses.
 //
 // Base URL contract: derived from the TokenPanel base of record
 // (`TOKENPANEL_DEFAULT_BASE`, honoring `TOKENPANEL_API_URL` exactly like
@@ -51,6 +67,12 @@ export const ALCORE_PROVIDER_PACKAGE = 'aisdk:@ai-sdk/openai-compatible';
 // in process memory only (never config, never disk, never logs).
 export const ALCORE_ENV_CREDENTIAL = 'ALCORE_USER_TOKEN';
 const ALCORE_CATALOG_TIMEOUT_MS = 15_000;
+// Same retry the Settings custom-provider form uses after its config write
+// (`storeKeyAfterConfigWrite`): OpenCode picks the block up from its file
+// watcher, and until then it rejects the key with "Integration not found".
+// Only that rejection is retried, briefly — anything else fails fast so a
+// credential outage never holds a proven login hostage.
+const ALCORE_CREDENTIAL_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 // Mirrors the model-capability vocabulary the provider registry validates.
 const ALCORE_KNOWN_CAPABILITIES = new Set(['text', 'image', 'audio', 'video', 'pdf']);
 
@@ -160,6 +182,21 @@ export const createAlcoreProviderRuntime = ({
   serviceFetch = (...args) => fetch(...args),
   env = process.env,
   isEnterprise = () => isEnterpriseMode(),
+  // OpenCode credential provisioning (task 48 — the badge flip). Shape:
+  // `{ listCredentialIDs: () => Promise<string[]>,
+  //    connectKey: (key: string) => Promise<void>,
+  //    removeCredential: (id: string) => Promise<void> }`.
+  // Production wires the real `@opencode/client` calls (global client, no
+  // directory — the same client the Settings API-key save uses); tests
+  // inject recording fakes. Null (default) keeps the task-42 behavior:
+  // provider block + ambient credential only, no OpenCode credential.
+  // The key stored is ALWAYS the caller's own keychained access Bearer
+  // from `fetchAlcoreCatalog` (refreshed on a 401) — never a service or
+  // management key, never from config, never logged.
+  openCodeCredentials = null,
+  // Wait between key-method retries (injectable so tests never sleep).
+  credentialWait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  credentialRetryDelaysMs = ALCORE_CREDENTIAL_RETRY_DELAYS_MS,
 } = {}) => {
   const readStoredAccess = async (sub) => {
     if (userTokenStore === null || userTokenStore === undefined) return '';
@@ -220,10 +257,83 @@ export const createAlcoreProviderRuntime = ({
     }
   };
 
+  // OpenCode still reports a custom provider as "Not signed in" until its
+  // integration holds a credential connection: the config block alone lists
+  // models but leaves `connections` empty. Stale credentials (an expired
+  // rotating JWT from a previous login) are removed first so one login never
+  // accumulates "Accounts" — a single fresh credential reads as Connected.
+  // Best-effort only: any failure warns (never the key) and the provider
+  // block already written above keeps serving models.
+  const provisionOpenCodeCredential = async (access) => {
+    if (openCodeCredentials === null || openCodeCredentials === undefined) return;
+    const key = String(access ?? '').trim();
+    if (key === '') return;
+    try {
+      let stale = [];
+      try {
+        stale = (await openCodeCredentials.listCredentialIDs()) ?? [];
+      } catch {
+        stale = [];
+      }
+      for (const credentialId of stale) {
+        try {
+          await openCodeCredentials.removeCredential(credentialId);
+        } catch {
+          // Best-effort: the fresh key below still flips the badge even
+          // when a stale entry lingers (it reads as an extra account).
+        }
+      }
+      const delays = Array.isArray(credentialRetryDelaysMs) ? credentialRetryDelaysMs : ALCORE_CREDENTIAL_RETRY_DELAYS_MS;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await openCodeCredentials.connectKey(key);
+          return;
+        } catch (error) {
+          const delay = delays[attempt];
+          const notRegisteredYet = error instanceof Error && /not found/i.test(error.message);
+          if (!notRegisteredYet || delay === undefined) throw error;
+          await credentialWait(delay);
+        }
+      }
+    } catch (error) {
+      console.warn(`[alcore-provider] credential sync skipped (${error?.code ?? 'unavailable'})`);
+    }
+  };
+
+  // Removes every `alcore` credential OpenCode holds. Best-effort: never
+  // throws, never logs ids or keys. Runs even in enterprise mode and even
+  // for an unknown subject — the credential is global, and removal only
+  // narrows access, so an orphan must never survive a sign-out.
+  const removeOpenCodeCredentials = async () => {
+    if (openCodeCredentials === null || openCodeCredentials === undefined) return;
+    try {
+      let ids = [];
+      try {
+        ids = (await openCodeCredentials.listCredentialIDs()) ?? [];
+      } catch {
+        ids = [];
+      }
+      for (const credentialId of ids) {
+        try {
+          await openCodeCredentials.removeCredential(credentialId);
+        } catch {
+          // Best-effort: sign-out already rotated the session secret and
+          // dropped the ambient credential; a lingering OpenCode entry is
+          // narrowed on the next login's stale-sweep anyway.
+        }
+      }
+    } catch {
+      // Best-effort: never fail a sign-out that already succeeded.
+    }
+  };
+
   // Best-effort registration after a proven login. Resolves `{ ok: true,
   // models }` or `{ ok: false, reason }` and NEVER rejects: a catalog
-  // outage, a refused token, enterprise mode, or a config-write failure
-  // must not break the login that just succeeded.
+  // outage, a refused token, enterprise mode, a config-write failure, or a
+  // credential-sync failure must not break the login that just succeeded.
+  // The credential stored is the caller's OWN keychained access Bearer from
+  // the catalog fetch above (refreshed once on a 401) — never a service or
+  // management key, never in config/disk/URL/logs.
   const syncOnLogin = async (sub) => {
     try {
       let enterprise = false;
@@ -256,6 +366,7 @@ export const createAlcoreProviderRuntime = ({
         // A frozen env object must not fail the sync: the config entry is
         // written and the card lists live models either way.
       }
+      await provisionOpenCodeCredential(catalog.access);
       return { ok: true, models: catalog.models.length };
     } catch (error) {
       console.warn(`[alcore-provider] login sync skipped (${error?.code ?? 'unavailable'})`);
@@ -264,8 +375,9 @@ export const createAlcoreProviderRuntime = ({
   };
 
   // Best-effort teardown on global sign-out. Always drops the ambient
-  // credential; the pair and the config entry follow when present. NEVER
-  // rejects. Removal runs even in enterprise mode: it only narrows access.
+  // credential and every OpenCode `alcore` credential; the pair and the
+  // config entry follow when present. NEVER rejects. Removal runs even in
+  // enterprise mode and even for an unknown subject: it only narrows access.
   const clearOnSignOut = async (sub) => {
     const outcome = { cleared: false, removed: false };
     try {
@@ -273,6 +385,7 @@ export const createAlcoreProviderRuntime = ({
     } catch {
       // Best-effort: the pair and config cleanup below still run.
     }
+    await removeOpenCodeCredentials();
     const id = subSchema.safeParse(sub).data;
     if (id === undefined) return outcome;
     if (userTokenStore !== null && userTokenStore !== undefined) {

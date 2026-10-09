@@ -49,6 +49,28 @@ const memoryTokenStore = ({ pairs = {}, refreshImpl = null } = {}) => {
   };
 };
 
+const memoryOpenCodeCredentials = ({
+  existingIds = [],
+  connectImpl = null,
+  listImpl = null,
+  removeImpl = null,
+} = {}) => {
+  const calls = { listed: 0, connected: [], removed: [], waited: [] };
+  return {
+    calls,
+    listCredentialIDs: listImpl ?? (async () => {
+      calls.listed += 1;
+      return [...existingIds];
+    }),
+    connectKey: connectImpl ?? (async (key) => {
+      calls.connected.push(key);
+    }),
+    removeCredential: removeImpl ?? (async (id) => {
+      calls.removed.push(id);
+    }),
+  };
+};
+
 const createHarness = ({
   catalogImpl = async () => okResponse(OPENAI_LIST),
   pairs = { 'user-1': { accessToken: 'user-access-1', refreshToken: 'user-refresh-1' } },
@@ -57,6 +79,8 @@ const createHarness = ({
   removeImpl = null,
   isEnterprise = () => false,
   envBase = null,
+  openCodeCredentials = null,
+  credentialWait = async () => undefined,
 } = {}) => {
   const requests = [];
   const serviceFetch = async (url, init) => {
@@ -68,6 +92,9 @@ const createHarness = ({
   const env = {};
   if (envBase !== null) env.TOKENPANEL_API_URL = envBase;
   const store = memoryTokenStore({ pairs, refreshImpl });
+  const openCode = openCodeCredentials === 'memory'
+    ? memoryOpenCodeCredentials()
+    : openCodeCredentials;
   const runtime = createAlcoreProviderRuntime({
     userTokenStore: store,
     upsertProviderConfig: upsertImpl === null
@@ -85,8 +112,10 @@ const createHarness = ({
     serviceFetch,
     env,
     isEnterprise,
+    openCodeCredentials: openCode,
+    credentialWait,
   });
-  return { runtime, requests, upserts, removals, env, store };
+  return { runtime, requests, upserts, removals, env, store, openCode };
 };
 
 describe('alcore provider base', () => {
@@ -270,6 +299,131 @@ describe('alcore sign-out cleanup', () => {
     const runtime = createAlcoreProviderRuntime({ env: {} });
     await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: false, removed: false });
     await expect(runtime.syncOnLogin('user-1')).resolves.toEqual({ ok: false, reason: 'not_wired' });
+  });
+});
+
+describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
+  test('stores the caller Bearer as the integration key after the config write', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    const { runtime, upserts } = createHarness({ openCodeCredentials: openCode });
+    const outcome = await runtime.syncOnLogin('user-1');
+    expect(outcome).toEqual({ ok: true, models: 2 });
+    expect(upserts).toHaveLength(1);
+    // The SAME keychained user Bearer powers catalog + credential: never a
+    // service key, never from config, never in a URL.
+    expect(openCode.calls.connected).toEqual(['user-access-1']);
+    expect(openCode.calls.listed).toBe(1);
+  });
+
+  test('sweeps stale credentials first so one login never accumulates accounts', async () => {
+    const openCode = memoryOpenCodeCredentials({ existingIds: ['cred-old-1', 'cred-old-2'] });
+    const { runtime } = createHarness({ openCodeCredentials: openCode });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(openCode.calls.removed).toEqual(['cred-old-1', 'cred-old-2']);
+    expect(openCode.calls.connected).toEqual(['user-access-1']);
+  });
+
+  test('stores the refreshed Bearer when the catalog 401s once', async () => {
+    let calls = 0;
+    const openCode = memoryOpenCodeCredentials();
+    const { runtime } = createHarness({
+      catalogImpl: async (url, init) => {
+        calls += 1;
+        return calls === 1 ? okResponse({ error: 'unauthorized' }, 401) : okResponse(OPENAI_LIST);
+      },
+      refreshImpl: (sub, held) => {
+        held.set(sub, { accessToken: 'fresh-access', refreshToken: 'rotated-refresh' });
+        return 'fresh-access';
+      },
+      openCodeCredentials: openCode,
+    });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(openCode.calls.connected).toEqual(['fresh-access']);
+  });
+
+  test('retries the key after a not-found until OpenCode picks up the config', async () => {
+    const waited = [];
+    let attempts = 0;
+    const openCode = memoryOpenCodeCredentials({
+      connectImpl: async (key) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('Integration not found');
+        openCode.calls.connected.push(key);
+      },
+    });
+    const { runtime } = createHarness({
+      openCodeCredentials: openCode,
+      credentialWait: async (ms) => { waited.push(ms); },
+    });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(attempts).toBe(2);
+    expect(waited).toEqual([250]);
+    expect(openCode.calls.connected).toEqual(['user-access-1']);
+  });
+
+  test('a failing credential sync never breaks the proven login', async () => {
+    const openCode = memoryOpenCodeCredentials({
+      connectImpl: async () => { throw Object.assign(new Error('openCode down'), { code: 'unavailable' }); },
+    });
+    const { runtime, upserts, env } = createHarness({ openCodeCredentials: openCode });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(upserts).toHaveLength(1);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBe('user-access-1');
+  });
+
+  test('unwired OpenCode keeps the task-42 block-only behavior', async () => {
+    const { runtime } = createHarness();
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+  });
+
+  test('enterprise mode skips credential work without store or network calls', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    const { runtime, requests, store } = createHarness({
+      isEnterprise: () => true,
+      openCodeCredentials: openCode,
+    });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: false, reason: 'enterprise_mode' });
+    expect(requests).toHaveLength(0);
+    expect(store.calls.read).toHaveLength(0);
+    expect(openCode.calls.listed).toBe(0);
+    expect(openCode.calls.connected).toHaveLength(0);
+  });
+
+  test('an invalid subject never touches store, network, or credentials', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    const { runtime, requests, store } = createHarness({ openCodeCredentials: openCode });
+    expect(await runtime.syncOnLogin('')).toEqual({ ok: false, reason: 'invalid_request' });
+    expect(store.calls.read).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+    expect(openCode.calls.listed).toBe(0);
+  });
+
+  test('sign-out removes every alcore credential beside the pair and entry', async () => {
+    const openCode = memoryOpenCodeCredentials({ existingIds: ['cred-1', 'cred-2'] });
+    const { runtime, removals, env, store } = createHarness({ openCodeCredentials: openCode });
+    env[ALCORE_ENV_CREDENTIAL] = 'stale-access';
+    expect(await runtime.clearOnSignOut('user-1')).toEqual({ cleared: true, removed: true });
+    expect(openCode.calls.removed).toEqual(['cred-1', 'cred-2']);
+    expect(store.calls.cleared).toEqual(['user-1']);
+    expect(removals).toEqual([[ALCORE_PROVIDER_ID, null, 'user']]);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBeUndefined();
+  });
+
+  test('sign-out with an unknown subject still removes orphan credentials', async () => {
+    const openCode = memoryOpenCodeCredentials({ existingIds: ['cred-orphan'] });
+    const { runtime, env } = createHarness({ openCodeCredentials: openCode });
+    env[ALCORE_ENV_CREDENTIAL] = 'stale-access';
+    expect(await runtime.clearOnSignOut('')).toEqual({ cleared: false, removed: false });
+    expect(openCode.calls.removed).toEqual(['cred-orphan']);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBeUndefined();
+  });
+
+  test('sign-out credential failures never reject', async () => {
+    const openCode = memoryOpenCodeCredentials({
+      listImpl: async () => { throw new Error('openCode down'); },
+    });
+    const { runtime } = createHarness({ openCodeCredentials: openCode });
+    await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: true, removed: true });
   });
 });
 
