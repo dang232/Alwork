@@ -284,12 +284,9 @@ export const createTokenpanelQuotaRuntime = ({
       }
       try {
         const resolved = await resolveQuotaBody(candidate.data, subject);
-        try { console.warn('[dbg-quota] ok subjectLen=' + subject.length); } catch {}
         return res.json(resolved.body);
       } catch (error) {
         const mapped = errorOf(error);
-        // TEMP-DEBUG (remove after diagnosis): outcome code only, no secrets.
-        try { console.warn('[dbg-quota] ' + (error && error.code) + ' subjectEmpty=' + (subject === '') + ' status=' + mapped.status); } catch {}
         return res.status(mapped.status).json(mapped.body);
       }
     });
