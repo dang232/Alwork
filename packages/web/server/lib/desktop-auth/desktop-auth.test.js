@@ -44,6 +44,7 @@ const createHarness = ({
   tunnelScope = null,
   alcoreSecret = 'test-alcore-secret-32-chars-long!!',
   userTokenStore = null,
+  onLoginTokens = null,
 } = {}) => {
   const routes = new Map();
   const seenSessions = [];
@@ -80,6 +81,7 @@ const createHarness = ({
     alcoreSecret,
     serviceFetch,
     userTokenStore: tokenStore,
+    onLoginTokens,
   });
   runtime.registerRoutes(
     {
@@ -937,6 +939,51 @@ describe('desktop login keychain capture', () => {
     expect(h.tokenSaves).toEqual([
       { sub: 'user-1', pair: { accessToken: access, refreshToken: 'google-refresh-1' } },
     ]);
+  });
+});
+
+describe('desktop login provider hook', () => {
+  const jwtAccess = (sub) => `header.${Buffer.from(JSON.stringify({ sub, sid: 'sess-1' })).toString('base64url')}.sig`;
+
+  test('a proven login notifies the hook with the verified subject only', async () => {
+    const access = jwtAccess('user-1');
+    const seen = [];
+    const h = createHarness({
+      serviceImpl: async () => h.serviceJson(200, { ...SERVICE_PAIR, access_token: access }),
+      onLoginTokens: async (sub) => { seen.push(sub); },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    // Subject only: tokens stay in the store, never cross the seam.
+    expect(seen).toEqual(['user-1']);
+  });
+
+  test('an unkeyable login notifies nothing and still succeeds', async () => {
+    const seen = [];
+    const h = createHarness({
+      serviceImpl: async () => h.serviceJson(200, SERVICE_PAIR),
+      onLoginTokens: async (sub) => { seen.push(sub); },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(seen).toHaveLength(0);
+  });
+
+  test('a throwing hook never fails the login', async () => {
+    const access = jwtAccess('user-1');
+    const h = createHarness({
+      serviceImpl: async () => h.serviceJson(200, { ...SERVICE_PAIR, access_token: access }),
+      onLoginTokens: async () => { throw new Error('sync exploded'); },
+    });
+    const { res } = await h.call('POST', '/api/auth/desktop/email/login', {
+      body: { email: 'a@example.test', password: 's3cret!!' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(h.seenSessions).toHaveLength(1);
   });
 });
 

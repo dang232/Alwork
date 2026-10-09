@@ -401,6 +401,9 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     // Display name a paired device shows for THIS server (issuing machine's
     // hostname), distinct from the per-device pairing label typed by the operator.
     getServerLabel = () => 'OpenChamber',
+    // Alcore provider sync (login registration, sign-out removal). Null in
+    // tests and in runtimes without the provider wiring: both hooks skip.
+    alcoreProvider = null,
     alcoreSecret,
     alcorePreviousSecret,
     alcoreIssuer,
@@ -688,6 +691,14 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     // The quota proxy shares this instance: a pair captured at loopback
     // completion is the pair the proxy presents.
     userTokenStore: sharedUserTokenStore(),
+    // Fire-and-forget on purpose: the provider sync fetches the live
+    // catalog over the network and must never delay the login response.
+    // The sync itself never rejects; the desktop seam swallows hook errors.
+    onLoginTokens: alcoreProvider === null || alcoreProvider === undefined
+      ? null
+      // A missing sync method throws inside the call: the desktop seam
+      // swallows hook errors, so no capability probe is needed here.
+      : (sub) => { void alcoreProvider.syncOnLogin(sub); },
   });
   desktopAuthRuntime.registerRoutes({
     get: (path, ...handlers) => app.get(path, ...handlers),
@@ -789,7 +800,29 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     }
     try {
       await uiAuthController.requireSessionAuth(req, res, async () => {
+        // Resolve the caller before the reset rotates secrets and clears
+        // the session: the Alcore teardown below is keyed by this subject.
+        let alcoreSub = '';
+        try {
+          alcoreSub = await uiAuthController.resolveRequestAlcoreSub?.(req) ?? '';
+        } catch {
+          alcoreSub = '';
+        }
         await uiAuthController.handleResetAuth(req, res);
+        // Best-effort Alcore teardown (keychain pair, provider entry,
+        // ambient credential). The reset response above is unchanged and
+        // cleanup never fails it — an unknown subject still drops the
+        // ambient credential inside clearOnSignOut.
+        try {
+          if (alcoreProvider !== null && alcoreProvider !== undefined) {
+            // The resolver answers a string; anything foreign coerces to
+            // one here and clearOnSignOut validates it again — an unknown
+            // subject still drops the ambient credential in there.
+            await alcoreProvider.clearOnSignOut(`${alcoreSub ?? ''}`);
+          }
+        } catch {
+          // Best-effort: sign-out already rotated the session secret.
+        }
       });
     } catch (error) {
       next(error);

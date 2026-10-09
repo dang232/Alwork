@@ -981,6 +981,70 @@ describe('client auth routes', () => {
     expect(response.body.tunnelUrl).toBe('https://worktree-a.example.trycloudflare.com');
   });
 
+describe('global sign-out alcore cleanup', () => {
+    const mountResetApp = ({ subject = 'user-1', withProvider = true } = {}) => {
+      const app = express();
+      const clearedSubs = [];
+      const syncedSubs = [];
+      const dependencies = {
+        express,
+        tunnelAuthController: {
+          classifyRequestScope: () => 'local',
+          requireTunnelSession: (_req, _res, next) => next(),
+          getTunnelSessionFromRequest: () => null,
+          clearTunnelSessionCookie: () => {},
+        },
+        uiAuthController: {
+          requireAuth: (_req, _res, next) => next(),
+          requireSessionAuth: (_req, _res, next) => next(),
+          resolveRequestAlcoreSub: async () => subject,
+          handleSessionStatus: (_req, res) => res.json({ authenticated: true }),
+          handleSessionCreate: (_req, res) => res.json({ authenticated: true }),
+          handlePasskeyStatus: (_req, res) => res.json({ enabled: false }),
+          handlePasskeyAuthenticationOptions: (_req, res) => res.json({}),
+          handlePasskeyAuthenticationVerify: (_req, res) => res.json({ authenticated: true }),
+          handlePasskeyRegistrationOptions: (_req, res) => res.json({}),
+          handlePasskeyRegistrationVerify: (_req, res) => res.json({ authenticated: true }),
+          handlePasskeyList: (_req, res) => res.json({ passkeys: [] }),
+          handlePasskeyRevoke: (_req, res) => res.json({ revoked: true }),
+          handleResetAuth: (_req, res) => res.json({ cleared: true, clearedPasskeys: 0, signedOutEverywhere: true }),
+        },
+        readSettingsFromDiskMigrated: async () => ({}),
+        normalizeTunnelSessionTtlMs: () => 1000,
+      };
+      if (withProvider) {
+        dependencies.alcoreProvider = {
+          syncOnLogin: async (sub) => { syncedSubs.push(sub); return { ok: true, models: 1 }; },
+          clearOnSignOut: async (sub) => { clearedSubs.push(sub); return { cleared: true, removed: true }; },
+        };
+      }
+      registerAuthAndAccessRoutes(app, dependencies);
+      return { app, clearedSubs, syncedSubs };
+    };
+
+    it('tears down the alcore provider keyed by the pre-reset subject', async () => {
+      const { app, clearedSubs } = mountResetApp({ subject: 'user-1' });
+      await request(app)
+        .post('/api/auth/reset')
+        .expect(200, { cleared: true, clearedPasskeys: 0, signedOutEverywhere: true });
+      expect(clearedSubs).toEqual(['user-1']);
+    });
+
+    it('still runs cleanup for an unknown subject and keeps the response', async () => {
+      const { app, clearedSubs } = mountResetApp({ subject: '' });
+      await request(app)
+        .post('/api/auth/reset')
+        .expect(200, { cleared: true, clearedPasskeys: 0, signedOutEverywhere: true });
+      expect(clearedSubs).toEqual(['']);
+    });
+
+    it('signs out unchanged when the provider wiring is absent', async () => {
+      const { app } = mountResetApp({ withProvider: false });
+      await request(app)
+        .post('/api/auth/reset')
+        .expect(200, { cleared: true, clearedPasskeys: 0, signedOutEverywhere: true });
+    });
+  });
   it('keeps the pid but not where the server is reachable on /api/system/info before login', async () => {
     const app = express();
     registerServerStatusRoutes(app, {

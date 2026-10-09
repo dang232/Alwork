@@ -197,6 +197,11 @@ export const createDesktopAuthRuntime = ({
   // Shared keychain store (production wiring passes the singleton; tests
   // inject a recording fake). Null disables capture without touching login.
   userTokenStore = null,
+  // Post-login hook (production: the Alcore provider sync reads the just
+  // captured pair from the store by subject). Receives the verified
+  // subject only — never tokens. Null disables the hook. A throwing hook
+  // never fails the login it follows.
+  onLoginTokens = null,
 } = {}) => {
   const serviceBase = resolveServiceBase(authServiceBase);
   const pendingGoogle = new Map();
@@ -304,6 +309,20 @@ export const createDesktopAuthRuntime = ({
     }
   };
 
+  // Best-effort post-login notification keyed by the verified subject.
+  // The hook re-reads the pair from the store itself, so no secret crosses
+  // this seam; a failure resolves silently and the proven login stands.
+  const notifyLoginTokens = async (sub) => {
+    try {
+      if (onLoginTokens === null || onLoginTokens === undefined) return;
+      const id = z.string().trim().min(1).safeParse(sub).data ?? '';
+      if (id === '') return;
+      await onLoginTokens(id);
+    } catch {
+      // A failing hook must not fail a proven login.
+    }
+  };
+
   const completeWithServicePair = async (req, res, pair, sessionOpts, completionProfile = null) => {
     const parsedPair = servicePairSchema.safeParse(pair);
     const token = parsedPair.success ? parsedPair.data.access_token.trim() : '';
@@ -324,6 +343,7 @@ export const createDesktopAuthRuntime = ({
       // below is keying only — trust comes from the 200 above, and the
       // unverified sub never gates anything.
       await captureUserTokens(decodeAccessTokenSub(captureToken), captureToken, refreshToken, res);
+      await notifyLoginTokens(decodeAccessTokenSub(captureToken));
       return;
     }
     // Packaged desktop: no shared secret is available (and none is shipped
@@ -344,6 +364,7 @@ export const createDesktopAuthRuntime = ({
     await uiAuthController.handleServiceVerifiedSessionCreate(req, res, { sub: confirmed.sub, sid: confirmed.sid });
     // The subject here was confirmed live against the service itself.
     await captureUserTokens(confirmed.sub, captureToken, refreshToken, res);
+    await notifyLoginTokens(confirmed.sub);
     return;
   };
 

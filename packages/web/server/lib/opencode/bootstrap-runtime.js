@@ -1,4 +1,7 @@
 import { registerNotificationEmitRoutes } from '../notifications/emit-route.js';
+import { createAlcoreProviderRuntime } from '../alcore-provider/alcore-provider.js';
+import { upsertProviderConfig, removeProviderConfig } from './providers.js';
+import { sharedUserTokenStore } from '../user-tokens/user-token-store.js';
 
 export const createBootstrapRuntime = (dependencies) => {
   const {
@@ -109,10 +112,20 @@ export const createBootstrapRuntime = (dependencies) => {
     });
     notificationEmitRoutes.registerPluginRoute();
 
+    // The Alcore provider card shares the desktop-login keychain: a pair
+    // captured at loopback completion is the pair the catalog sync
+    // presents, and global sign-out clears it beside the provider entry.
+    const alcoreProvider = createAlcoreProviderRuntime({
+      userTokenStore: sharedUserTokenStore(),
+      upsertProviderConfig,
+      removeProviderConfig,
+    });
+
     const authAndAccessRoutes = registerAuthAndAccessRoutes(app, {
       express,
       tunnelAuthController,
       uiAuthController,
+      alcoreProvider,
       alcoreSecret,
       alcorePreviousSecret,
       alcoreIssuer,
