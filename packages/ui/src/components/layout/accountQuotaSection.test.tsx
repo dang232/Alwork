@@ -76,11 +76,23 @@ test('loading renders the loading notice with no refresh control', () => {
   expect(container.querySelector('[data-testid="account-quota-refresh"]')).toBeNull();
 });
 
-test('a zero-amount balance shows values without a bar', () => {
+test('a zero-amount balance keeps its values above an empty track', () => {
   const container = render(zeroAmount);
 
   expect(container.textContent).toContain('Available balance');
-  expect(container.querySelector('[role="progressbar"]')).toBeNull();
+  expect(container.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('0');
+});
+
+test('a negative or non-finite balance renders an empty track without crashing', () => {
+  for (const balance of [
+    { amountMicros: -100, reservedMicros: 0, availableMicros: 0, currency: 'USD' },
+    { amountMicros: Number.NaN, reservedMicros: 0, availableMicros: 0, currency: 'USD' },
+    { amountMicros: 0, reservedMicros: Number.POSITIVE_INFINITY, availableMicros: Number.NaN, currency: 'USD' },
+  ]) {
+    const container = render({ state: 'live', balance, usage: zeroAmount.usage });
+    expect(container.textContent).toContain('Available balance');
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('0');
+  }
 });
 
 test('the refresh control asks for a fresh read', () => {

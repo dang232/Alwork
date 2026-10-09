@@ -9,8 +9,9 @@ import { formatQuotaMoney, quotaBalanceShares, type AccountQuota } from './accou
 // speaking the usage panel's row vocabulary: a labeled bar for the one
 // share the read API can support (available-vs-total balance) and plain
 // value rows for the usage totals, which have no server-side limit to
-// percent against. A zero-amount balance shows its value without a bar,
-// like the usage panel's balance-only windows. Unavailable never renders
+// percent against. The balance bar always renders once a balance is
+// known: a zero-amount balance shows its values above an empty 0% track,
+// never a hidden bar, never a divide-by-zero. Unavailable never renders
 // numbers — only the muted notice, never a fabricated quota.
 
 export const AccountQuotaSection: React.FC<{
@@ -67,11 +68,14 @@ export const AccountQuotaSection: React.FC<{
                 {t('header.account.quota.balanceValue', { available: availableText, total: totalText })}
               </span>
             </div>
-            {shares !== null && shares.availablePercent !== null ? (
+            {shares !== null ? (
               <div className="mt-1.5">
+                {/* A missing share (zero/empty/non-finite total) is an
+                    empty track at 0%, not a hidden bar. The helper guards
+                    the divide-by-zero; the fallback only picks the fill. */}
                 <UsageProgressBar
-                  percent={shares.availablePercent}
-                  tonePercent={shares.usedPercent}
+                  percent={shares.availablePercent ?? 0}
+                  tonePercent={shares.usedPercent ?? 0}
                   className="h-1.5"
                 />
               </div>
