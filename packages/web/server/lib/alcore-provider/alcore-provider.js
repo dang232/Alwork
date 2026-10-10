@@ -8,11 +8,20 @@
 // live model catalog from the platform with that Bearer, writes the
 // provider block into the OpenCode user config through the same
 // `upsertProviderConfig` registry the Settings form uses — no parallel
-// provider system — and stores that SAME caller Bearer as the integration
-// credential (`POST /api/integration/alcore/connect/key`, the exact path
-// the Settings custom-provider form uses after its config write). On
-// global sign-out it removes the OpenCode credential(s), the config entry,
-// clears the pair, and drops the ambient credential, so nothing is orphaned.
+// provider system — then mints ONE personal API key for the caller's own
+// link (`POST /admin/ide/personal-key`, see `./personal-key.js`) and stores
+// that key as the integration credential
+// (`POST /api/integration/alcore/connect/key`, the exact path
+// the Settings custom-provider form uses after its config write). The
+// credential is a real customer API key, never the rotating login token:
+// login-token rotation/expiry cannot touch it, and a restart keeps it
+// working (the secret lives in the OpenCode credential store, the row
+// reference in `alcore-personal-keys.json`). When the mint fails the block
+// is still written but no credential is stored, so the card reads
+// "Not signed in" while the proven login stands. On global sign-out it
+// revokes the minted key id, removes the OpenCode credential(s), the config
+// entry, clears the pair, and drops the ambient credential, so nothing is
+// orphaned.
 //
 // Badge contract (OpenCode-chat state, read — never guessed):
 // `packages/ui/src/components/sections/providers/providerAuth.ts`
@@ -42,8 +51,9 @@
 // the login standing — a catalog outage must never break a proven login
 // nor masquerade as an empty model list. The config block itself carries
 // NO secret: auth travels via `env: [ALCORE_USER_TOKEN]`, whose value the
-// server holds in process memory only (set after a successful sync,
-// deleted on sign-out). Nothing here logs tokens, subs, or responses.
+// server holds in process memory only (the MINTED personal key after a
+// successful sync, deleted on sign-out or when the mint fails so no stale
+// login Bearer can linger). Nothing here logs tokens, subs, or responses.
 //
 // Enterprise boundary (provider-entry class): registration is refused
 // while enterprise mode is on — providers come from the administrator's
@@ -182,18 +192,26 @@ export const createAlcoreProviderRuntime = ({
   serviceFetch = (...args) => fetch(...args),
   env = process.env,
   isEnterprise = () => isEnterpriseMode(),
-  // OpenCode credential provisioning (task 48 — the badge flip). Shape:
+  // OpenCode credential provisioning (task 48 — the badge flip, task 51 —
+  // the personal key). Shape:
   // `{ listCredentialIDs: () => Promise<string[]>,
   //    connectKey: (key: string) => Promise<void>,
   //    removeCredential: (id: string) => Promise<void> }`.
   // Production wires the real `@opencode/client` calls (global client, no
   // directory — the same client the Settings API-key save uses); tests
-  // inject recording fakes. Null (default) keeps the task-42 behavior:
-  // provider block + ambient credential only, no OpenCode credential.
-  // The key stored is ALWAYS the caller's own keychained access Bearer
-  // from `fetchAlcoreCatalog` (refreshed on a 401) — never a service or
-  // management key, never from config, never logged.
+  // inject recording fakes. Null (default) keeps the block-only behavior:
+  // provider block, no OpenCode credential.
+  // The key stored is ALWAYS the freshly minted personal API key for the
+  // caller's own link (see `./personal-key.js`) — never the rotating login
+  // Bearer, never a service or management key, never from config, never
+  // logged.
   openCodeCredentials = null,
+  // Personal-key provisioning (task 51): `{ mintPersonalKey,
+  // revokePersonalKey, readKeyId }` from `./personal-key.js` (production:
+  // `createPersonalKeyRuntime`; tests: a recording fake). Null (default)
+  // keeps the block-only behavior: the provider block is still written,
+  // but no key is minted and no credential is stored.
+  personalKeys = null,
   // Wait between key-method retries (injectable so tests never sleep).
   credentialWait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   credentialRetryDelaysMs = ALCORE_CREDENTIAL_RETRY_DELAYS_MS,
@@ -257,6 +275,24 @@ export const createAlcoreProviderRuntime = ({
     }
   };
 
+  // Mint the provider credential: one personal API key for the caller's
+  // own link (see `./personal-key.js`). Resolves `{ key }` on success or
+  // `{ reason }` when no key is available (unwired mint runtime, refused or
+  // unreachable mint, malformed answer) — the caller degrades to the
+  // block-only "Not signed in" card, never a broken login.
+  const mintProviderCredential = async (sub) => {
+    if (personalKeys === null || personalKeys === undefined) {
+      return { key: null, reason: 'not_wired' };
+    }
+    try {
+      const minted = await personalKeys.mintPersonalKey(sub);
+      const key = z.string().min(1).safeParse(minted?.key).data ?? '';
+      if (key === '') return { key: null, reason: 'personal_key_unavailable' };
+      return { key, reason: null };
+    } catch (error) {
+      return { key: null, reason: error?.code ?? 'personal_key_unavailable' };
+    }
+  };
   // OpenCode still reports a custom provider as "Not signed in" until its
   // integration holds a credential connection: the config block alone lists
   // models but leaves `connections` empty. Stale credentials (an expired
@@ -329,11 +365,14 @@ export const createAlcoreProviderRuntime = ({
 
   // Best-effort registration after a proven login. Resolves `{ ok: true,
   // models }` or `{ ok: false, reason }` and NEVER rejects: a catalog
-  // outage, a refused token, enterprise mode, a config-write failure, or a
-  // credential-sync failure must not break the login that just succeeded.
-  // The credential stored is the caller's OWN keychained access Bearer from
-  // the catalog fetch above (refreshed once on a 401) — never a service or
-  // management key, never in config/disk/URL/logs.
+  // outage, a refused token, enterprise mode, a config-write failure, a
+  // refused/unreachable personal-key mint, or a credential-sync failure
+  // must not break the login that just succeeded. The credential stored is
+  // the freshly minted personal API key for the caller's own link (see
+  // `./personal-key.js`) — never the rotating login Bearer, never a
+  // service or management key, never in config/disk/URL/logs. When the
+  // mint is unavailable the provider block is still written but no secret
+  // is stored, so the card reads "Not signed in" while the rest works.
   const syncOnLogin = async (sub) => {
     try {
       let enterprise = false;
@@ -360,13 +399,26 @@ export const createAlcoreProviderRuntime = ({
         'user',
         {},
       );
+      const credential = await mintProviderCredential(id);
+      if (credential.key === null) {
+        // Mint failure never breaks the login: the block above is written
+        // (live models listed) but no secret is stored, so the card reads
+        // "Not signed in". Any stale ambient value is dropped so an old
+        // login Bearer can never linger past its rotation.
+        try {
+          delete env[ALCORE_ENV_CREDENTIAL];
+        } catch {
+          // Best-effort: the card state above is what matters.
+        }
+        return { ok: false, reason: credential.reason };
+      }
       try {
-        env[ALCORE_ENV_CREDENTIAL] = catalog.access;
+        env[ALCORE_ENV_CREDENTIAL] = credential.key;
       } catch {
         // A frozen env object must not fail the sync: the config entry is
         // written and the card lists live models either way.
       }
-      await provisionOpenCodeCredential(catalog.access);
+      await provisionOpenCodeCredential(credential.key);
       return { ok: true, models: catalog.models.length };
     } catch (error) {
       console.warn(`[alcore-provider] login sync skipped (${error?.code ?? 'unavailable'})`);
@@ -374,19 +426,41 @@ export const createAlcoreProviderRuntime = ({
     }
   };
 
-  // Best-effort teardown on global sign-out. Always drops the ambient
-  // credential and every OpenCode `alcore` credential; the pair and the
-  // config entry follow when present. NEVER rejects. Removal runs even in
-  // enterprise mode and even for an unknown subject: it only narrows access.
+  // Best-effort teardown on global sign-out. Revokes the minted personal
+  // key id FIRST (the caller's Bearer is still keychained here — clearPair
+  // runs below — and the revoke is what turns a sign-out into a dead
+  // provider key), then drops the ambient credential and every OpenCode
+  // `alcore` credential; the pair and the config entry follow when present.
+  // NEVER rejects. Removal runs even in enterprise mode and even for an
+  // unknown subject: it only narrows access. A refused or unreachable
+  // revoke still proceeds to the local removal, and the next login's
+  // rotate-with-revoke-old cleans up any surviving row regardless.
   const clearOnSignOut = async (sub) => {
     const outcome = { cleared: false, removed: false };
+    const id = subSchema.safeParse(sub).data;
+    if (id !== undefined && personalKeys !== null && personalKeys !== undefined) {
+      try {
+        let storedId = null;
+        try {
+          storedId = await personalKeys.readKeyId(id);
+        } catch {
+          storedId = null;
+        }
+        // A recorded id revokes exactly that row; without one the server
+        // revokes every active personal row for the caller — either way no
+        // personal key survives the sign-out.
+        await personalKeys.revokePersonalKey(id, storedId ?? undefined);
+      } catch {
+        // Best-effort: sign-out already rotated the session secret and the
+        // local removal below still runs.
+      }
+    }
     try {
       delete env[ALCORE_ENV_CREDENTIAL];
     } catch {
       // Best-effort: the pair and config cleanup below still run.
     }
     await removeOpenCodeCredentials();
-    const id = subSchema.safeParse(sub).data;
     if (id === undefined) return outcome;
     if (userTokenStore !== null && userTokenStore !== undefined) {
       try {

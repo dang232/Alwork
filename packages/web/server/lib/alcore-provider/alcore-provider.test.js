@@ -71,6 +71,28 @@ const memoryOpenCodeCredentials = ({
   };
 };
 
+const memoryPersonalKeys = ({ mintImpl = null } = {}) => {
+  const calls = { minted: [], revoked: [] };
+  const keyIds = new Map();
+  return {
+    calls,
+    keyIds,
+    mintPersonalKey: async (sub) => {
+      calls.minted.push(sub);
+      if (mintImpl) return mintImpl(sub, keyIds);
+      const minted = { key: 'personal-key-1', keyId: 'key-id-1', prefix: 'tp_live_personal0001' };
+      keyIds.set(sub, minted.keyId);
+      return minted;
+    },
+    revokePersonalKey: async (sub, keyId) => {
+      calls.revoked.push([sub, keyId ?? null]);
+      keyIds.delete(sub);
+      return { revoked: keyId === undefined ? ['key-id-1'] : [keyId] };
+    },
+    readKeyId: async (sub) => keyIds.get(sub) ?? null,
+  };
+};
+
 const createHarness = ({
   catalogImpl = async () => okResponse(OPENAI_LIST),
   pairs = { 'user-1': { accessToken: 'user-access-1', refreshToken: 'user-refresh-1' } },
@@ -80,6 +102,7 @@ const createHarness = ({
   isEnterprise = () => false,
   envBase = null,
   openCodeCredentials = null,
+  personalKeys = 'memory',
   credentialWait = async () => undefined,
 } = {}) => {
   const requests = [];
@@ -95,6 +118,7 @@ const createHarness = ({
   const openCode = openCodeCredentials === 'memory'
     ? memoryOpenCodeCredentials()
     : openCodeCredentials;
+  const personal = personalKeys === 'memory' ? memoryPersonalKeys() : personalKeys;
   const runtime = createAlcoreProviderRuntime({
     userTokenStore: store,
     upsertProviderConfig: upsertImpl === null
@@ -113,9 +137,10 @@ const createHarness = ({
     env,
     isEnterprise,
     openCodeCredentials: openCode,
+    personalKeys: personal,
     credentialWait,
   });
-  return { runtime, requests, upserts, removals, env, store, openCode };
+  return { runtime, requests, upserts, removals, env, store, openCode, personalKeys: personal };
 };
 
 describe('alcore provider base', () => {
@@ -225,7 +250,7 @@ describe('alcore catalog fetch', () => {
 
 describe('alcore login sync', () => {
   test('registers the provider through the shared registry with live models', async () => {
-    const { runtime, upserts, env } = createHarness();
+    const { runtime, upserts, env, personalKeys } = createHarness();
     const outcome = await runtime.syncOnLogin('user-1');
     expect(outcome).toEqual({ ok: true, models: 2 });
     expect(upserts).toHaveLength(1);
@@ -242,8 +267,11 @@ describe('alcore login sync', () => {
     });
     expect(Object.keys(config.models).sort()).toEqual(['alcore-deep', 'alcore-fast']);
     // The ambient credential is memory-only: the config names the variable,
-    // the value never touches disk or logs.
-    expect(env[ALCORE_ENV_CREDENTIAL]).toBe('user-access-1');
+    // the value never touches disk or logs. The value is the MINTED personal
+    // key — never the rotating login Bearer, so rotation/expiry cannot
+    // touch the stored provider key.
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBe('personal-key-1');
+    expect(personalKeys.calls.minted).toEqual(['user-1']);
   });
 
   test('an empty catalog skips registration instead of writing no models', async () => {
@@ -252,11 +280,13 @@ describe('alcore login sync', () => {
     expect(upserts).toHaveLength(0);
   });
 
-  test('enterprise mode skips registration without a network call', async () => {
-    const { runtime, requests, upserts } = createHarness({ isEnterprise: () => true });
+  test('enterprise mode skips registration without a network or mint call', async () => {
+    const { runtime, requests, upserts, personalKeys } = createHarness({ isEnterprise: () => true });
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: false, reason: 'enterprise_mode' });
     expect(requests).toHaveLength(0);
     expect(upserts).toHaveLength(0);
+    // No key is ever minted while the mode is on.
+    expect(personalKeys.calls.minted).toHaveLength(0);
   });
 
   test('a failing config write never rejects the login', async () => {
@@ -302,16 +332,16 @@ describe('alcore sign-out cleanup', () => {
   });
 });
 
-describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
-  test('stores the caller Bearer as the integration key after the config write', async () => {
+describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — personal key)', () => {
+  test('stores the minted personal key as the integration key after the config write', async () => {
     const openCode = memoryOpenCodeCredentials();
     const { runtime, upserts } = createHarness({ openCodeCredentials: openCode });
     const outcome = await runtime.syncOnLogin('user-1');
     expect(outcome).toEqual({ ok: true, models: 2 });
     expect(upserts).toHaveLength(1);
-    // The SAME keychained user Bearer powers catalog + credential: never a
-    // service key, never from config, never in a URL.
-    expect(openCode.calls.connected).toEqual(['user-access-1']);
+    // The minted customer API key powers the credential: never the rotating
+    // login Bearer, never a service key, never from config, never in a URL.
+    expect(openCode.calls.connected).toEqual(['personal-key-1']);
     expect(openCode.calls.listed).toBe(1);
   });
 
@@ -320,10 +350,10 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
     const { runtime } = createHarness({ openCodeCredentials: openCode });
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
     expect(openCode.calls.removed).toEqual(['cred-old-1', 'cred-old-2']);
-    expect(openCode.calls.connected).toEqual(['user-access-1']);
+    expect(openCode.calls.connected).toEqual(['personal-key-1']);
   });
 
-  test('stores the refreshed Bearer when the catalog 401s once', async () => {
+  test('stores the minted key — not the refreshed Bearer — when the catalog 401s once', async () => {
     let calls = 0;
     const openCode = memoryOpenCodeCredentials();
     const { runtime } = createHarness({
@@ -337,8 +367,10 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
       },
       openCodeCredentials: openCode,
     });
+    // Login-token rotation must not affect the stored provider key: the
+    // credential is the minted key even though the catalog Bearer rotated.
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
-    expect(openCode.calls.connected).toEqual(['fresh-access']);
+    expect(openCode.calls.connected).toEqual(['personal-key-1']);
   });
 
   test('retries the key after a not-found until OpenCode picks up the config', async () => {
@@ -358,7 +390,7 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
     expect(attempts).toBe(2);
     expect(waited).toEqual([250]);
-    expect(openCode.calls.connected).toEqual(['user-access-1']);
+    expect(openCode.calls.connected).toEqual(['personal-key-1']);
   });
 
   test('a failing credential sync never breaks the proven login', async () => {
@@ -368,7 +400,7 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
     const { runtime, upserts, env } = createHarness({ openCodeCredentials: openCode });
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
     expect(upserts).toHaveLength(1);
-    expect(env[ALCORE_ENV_CREDENTIAL]).toBe('user-access-1');
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBe('personal-key-1');
   });
 
   test('unwired OpenCode keeps the task-42 block-only behavior', async () => {
@@ -376,15 +408,16 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
   });
 
-  test('enterprise mode skips credential work without store or network calls', async () => {
+  test('enterprise mode skips credential work without store, mint, or network calls', async () => {
     const openCode = memoryOpenCodeCredentials();
-    const { runtime, requests, store } = createHarness({
+    const { runtime, requests, store, personalKeys } = createHarness({
       isEnterprise: () => true,
       openCodeCredentials: openCode,
     });
     expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: false, reason: 'enterprise_mode' });
     expect(requests).toHaveLength(0);
     expect(store.calls.read).toHaveLength(0);
+    expect(personalKeys.calls.minted).toHaveLength(0);
     expect(openCode.calls.listed).toBe(0);
     expect(openCode.calls.connected).toHaveLength(0);
   });
@@ -398,11 +431,14 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
     expect(openCode.calls.listed).toBe(0);
   });
 
-  test('sign-out removes every alcore credential beside the pair and entry', async () => {
+  test('sign-out revokes the minted id, then removes every alcore credential beside the pair and entry', async () => {
     const openCode = memoryOpenCodeCredentials({ existingIds: ['cred-1', 'cred-2'] });
-    const { runtime, removals, env, store } = createHarness({ openCodeCredentials: openCode });
+    const { runtime, removals, env, store, personalKeys } = createHarness({ openCodeCredentials: openCode });
     env[ALCORE_ENV_CREDENTIAL] = 'stale-access';
+    personalKeys.keyIds.set('user-1', 'key-id-1');
     expect(await runtime.clearOnSignOut('user-1')).toEqual({ cleared: true, removed: true });
+    // The recorded id revokes exactly that row — the sign-out kills the key.
+    expect(personalKeys.calls.revoked).toEqual([['user-1', 'key-id-1']]);
     expect(openCode.calls.removed).toEqual(['cred-1', 'cred-2']);
     expect(store.calls.cleared).toEqual(['user-1']);
     expect(removals).toEqual([[ALCORE_PROVIDER_ID, null, 'user']]);
@@ -424,6 +460,96 @@ describe('alcore OpenCode credential sync (task 48 — badge flip)', () => {
     });
     const { runtime } = createHarness({ openCodeCredentials: openCode });
     await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: true, removed: true });
+  });
+
+  test('a refused mint keeps the block but stores no secret (Not signed in, login stands)', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    const personalKeys = memoryPersonalKeys({
+      mintImpl: () => { throw Object.assign(new Error('no link'), { code: 'PERSONAL_KEY_REJECTED' }); },
+    });
+    const { runtime, upserts, env } = createHarness({ openCodeCredentials: openCode, personalKeys });
+    env[ALCORE_ENV_CREDENTIAL] = 'stale-access';
+    const outcome = await runtime.syncOnLogin('user-1');
+    expect(outcome).toEqual({ ok: false, reason: 'PERSONAL_KEY_REJECTED' });
+    // Live models listed, but no secret anywhere: the card reads
+    // Not signed in while the proven login stands.
+    expect(upserts).toHaveLength(1);
+    expect(openCode.calls.connected).toHaveLength(0);
+    expect(openCode.calls.listed).toBe(0);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBeUndefined();
+  });
+
+  test('unwired personal keys keep the block-only behavior without secrets', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    const { runtime, upserts, env } = createHarness({ openCodeCredentials: openCode, personalKeys: null });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: false, reason: 'not_wired' });
+    expect(upserts).toHaveLength(1);
+    expect(openCode.calls.connected).toHaveLength(0);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBeUndefined();
+  });
+
+  test('relogin mints again and stores the fresh key (server rotates-with-revoke-old)', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    let rotations = 0;
+    const personalKeys = memoryPersonalKeys({
+      mintImpl: (sub, keyIds) => {
+        rotations += 1;
+        const minted = { key: `personal-key-${rotations}`, keyId: `key-id-${rotations}`, prefix: 'tp_live_personal0001' };
+        keyIds.set(sub, minted.keyId);
+        return minted;
+      },
+    });
+    const { runtime, env } = createHarness({ openCodeCredentials: openCode, personalKeys });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(personalKeys.calls.minted).toEqual(['user-1', 'user-1']);
+    // The stored credential is always a minted key — a login Bearer never
+    // lands there, so rotation/expiry of login tokens cannot touch it.
+    expect(openCode.calls.connected).toEqual(['personal-key-1', 'personal-key-2']);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBe('personal-key-2');
+    expect(personalKeys.keyIds.get('user-1')).toBe('key-id-2');
+  });
+
+  test('no stored pair mints nothing and stores nothing', async () => {
+    const openCode = memoryOpenCodeCredentials();
+    const { runtime, upserts, env, personalKeys } = createHarness({
+      pairs: {},
+      openCodeCredentials: openCode,
+    });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: false, reason: 'ALCORE_NOT_CONFIGURED' });
+    expect(upserts).toHaveLength(0);
+    expect(personalKeys.calls.minted).toHaveLength(0);
+    expect(openCode.calls.connected).toHaveLength(0);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBeUndefined();
+  });
+
+  test('sign-out without a recorded id revokes every personal row for the caller', async () => {
+    const { runtime, personalKeys } = createHarness();
+    await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: true, removed: true });
+    expect(personalKeys.calls.revoked).toEqual([['user-1', null]]);
+  });
+
+  test('a refused revoke still clears, removes, and resolves', async () => {
+    const openCode = memoryOpenCodeCredentials({ existingIds: ['cred-1'] });
+    const personalKeys = memoryPersonalKeys();
+    personalKeys.revokePersonalKey = async (sub, keyId) => {
+      personalKeys.calls.revoked.push([sub, keyId ?? null]);
+      throw Object.assign(new Error('panel down'), { code: 'PERSONAL_KEY_UNAVAILABLE' });
+    };
+    const { runtime, env, store } = createHarness({ openCodeCredentials: openCode, personalKeys });
+    env[ALCORE_ENV_CREDENTIAL] = 'stale-access';
+    await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: true, removed: true });
+    expect(personalKeys.calls.revoked).toEqual([['user-1', null]]);
+    expect(openCode.calls.removed).toEqual(['cred-1']);
+    expect(store.calls.cleared).toEqual(['user-1']);
+    expect(env[ALCORE_ENV_CREDENTIAL]).toBeUndefined();
+  });
+
+  test('enterprise sign-out still revokes (removal only narrows access)', async () => {
+    const { runtime, personalKeys } = createHarness({ isEnterprise: () => true });
+    personalKeys.keyIds.set('user-1', 'key-id-9');
+    await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: true, removed: true });
+    expect(personalKeys.calls.revoked).toEqual([['user-1', 'key-id-9']]);
   });
 });
 

@@ -1,6 +1,7 @@
 import { OpenCode } from '@opencode/client';
 import { registerNotificationEmitRoutes } from '../notifications/emit-route.js';
 import { ALCORE_PROVIDER_ID, createAlcoreProviderRuntime } from '../alcore-provider/alcore-provider.js';
+import { createFileKeyIdStore, createPersonalKeyRuntime } from '../alcore-provider/personal-key.js';
 import { upsertProviderConfig, removeProviderConfig } from './providers.js';
 import { sharedUserTokenStore } from '../user-tokens/user-token-store.js';
 
@@ -123,10 +124,12 @@ export const createBootstrapRuntime = (dependencies) => {
     // The Alcore provider card shares the desktop-login keychain: a pair
     // captured at loopback completion is the pair the catalog sync
     // presents, and global sign-out clears it beside the provider entry.
-    // The OpenCode credential is the SAME caller Bearer (never a service
-    // key): stored via `integration.connect.key` so the card reads
-    // Connected, removed on sign-out so no orphan survives. Unwired (no
-    // OpenCode URL/auth) keeps the task-42 block-only behavior.
+    // The OpenCode credential is the freshly minted personal API key for
+    // the caller's own link (never the rotating login Bearer, never a
+    // service key): stored via `integration.connect.key` so the card reads
+    // Connected, revoked by id plus removed on sign-out so no orphan
+    // survives. Unwired (no OpenCode URL/auth) keeps the block-only
+    // behavior.
     const openCodeWired = buildOpenCodeUrl !== null && buildOpenCodeUrl !== undefined
       && getOpenCodeAuthHeaders !== null && getOpenCodeAuthHeaders !== undefined;
     const openCodeCredentials = openCodeWired
@@ -158,11 +161,26 @@ export const createBootstrapRuntime = (dependencies) => {
         },
       }
       : null;
+    // The personal API key behind the provider credential: minted with the
+    // caller's own keychained Bearer at login, revoked by key id at
+    // sign-out. The key-id ref file lives beside the other server stores so
+    // a restart still knows which row to revoke; the secret itself is never
+    // persisted here (OpenCode owns the credential, memory owns the ambient
+    // value). An unwired data dir falls back to the module default.
+    const personalKeys = createPersonalKeyRuntime({
+      userTokenStore: sharedUserTokenStore(),
+      keyIdStore: createFileKeyIdStore({
+        filePath: openchamberDataDir && path
+          ? path.join(openchamberDataDir, 'alcore-personal-keys.json')
+          : undefined,
+      }),
+    });
     const alcoreProvider = createAlcoreProviderRuntime({
       userTokenStore: sharedUserTokenStore(),
       upsertProviderConfig,
       removeProviderConfig,
       openCodeCredentials,
+      personalKeys,
     });
 
     const authAndAccessRoutes = registerAuthAndAccessRoutes(app, {
