@@ -1045,6 +1045,70 @@ describe('global sign-out alcore cleanup', () => {
         .expect(200, { cleared: true, clearedPasskeys: 0, signedOutEverywhere: true });
     });
   });
+
+  describe('alcore readiness route', () => {
+    const mountReadinessApp = (alcoreProvider) => {
+      const app = express();
+      const dependencies = {
+        express,
+        tunnelAuthController: {
+          classifyRequestScope: () => 'local',
+          requireTunnelSession: (_req, _res, next) => next(),
+          getTunnelSessionFromRequest: () => null,
+          clearTunnelSessionCookie: () => {},
+        },
+        uiAuthController: {
+          requireAuth: (_req, _res, next) => next(),
+          requireSessionAuth: (_req, _res, next) => next(),
+          resolveRequestAlcoreSub: async () => 'user-1',
+          handleSessionStatus: (_req, res) => res.json({ authenticated: true }),
+          handleSessionCreate: (_req, res) => res.json({ authenticated: true }),
+          handlePasskeyStatus: (_req, res) => res.json({ enabled: false }),
+          handlePasskeyAuthenticationOptions: (_req, res) => res.json({}),
+          handlePasskeyAuthenticationVerify: (_req, res) => res.json({ authenticated: true }),
+          handlePasskeyRegistrationOptions: (_req, res) => res.json({}),
+          handlePasskeyRegistrationVerify: (_req, res) => res.json({ authenticated: true }),
+          handlePasskeyList: (_req, res) => res.json({ passkeys: [] }),
+          handlePasskeyRevoke: (_req, res) => res.json({ revoked: true }),
+          handleResetAuth: (_req, res) => res.json({ cleared: true, clearedPasskeys: 0, signedOutEverywhere: true }),
+        },
+        readSettingsFromDiskMigrated: async () => ({}),
+        normalizeTunnelSessionTtlMs: () => 1000,
+      };
+      if (alcoreProvider !== undefined) dependencies.alcoreProvider = alcoreProvider;
+      registerAuthAndAccessRoutes(app, dependencies);
+      return app;
+    };
+
+    it('serves the provider readiness snapshot without secrets', async () => {
+      const app = mountReadinessApp({
+        getReadiness: () => ({ state: 'syncing', updatedAt: 123, needsRestart: false }),
+      });
+      await request(app)
+        .get('/api/alcore/readiness')
+        .expect(200, { state: 'syncing', needsRestart: false });
+    });
+
+    it('answers idle when the provider wiring is absent', async () => {
+      const app = mountReadinessApp(undefined);
+      await request(app)
+        .get('/api/alcore/readiness')
+        .expect(200, { state: 'idle', needsRestart: false });
+    });
+
+    it('answers idle when the snapshot is malformed or the provider throws', async () => {
+      const malformed = mountReadinessApp({ getReadiness: () => null });
+      await request(malformed)
+        .get('/api/alcore/readiness')
+        .expect(200, { state: 'idle', needsRestart: false });
+      const throwing = mountReadinessApp({
+        getReadiness: () => { throw new Error('provider down'); },
+      });
+      await request(throwing)
+        .get('/api/alcore/readiness')
+        .expect(200, { state: 'idle', needsRestart: false });
+    });
+  });
   it('keeps the pid but not where the server is reachable on /api/system/info before login', async () => {
     const app = express();
     registerServerStatusRoutes(app, {

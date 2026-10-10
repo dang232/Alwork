@@ -62,6 +62,16 @@
 // server paths (desktop-login sync, reset cleanup); VS Code runs no such
 // server (no Alcore card there); hosted/Capacitor mobile inherit the
 // shared-UI behavior wherever this server runs.
+//
+// Readiness gate (task 55 — the post-login race, see
+// `.omo/evidence/task-54-provider-unavailable.md`): after the block +
+// credential writes, the sync polls the managed OpenCode model surface
+// for the alcore entries (bounded ~30 s) before reporting complete, and
+// publishes the gate at `getReadiness()` for the `GET
+// /api/alcore/readiness` route the composer hold reads. An external
+// OpenCode never sees this process's write, so the gate reports
+// `needs_restart` there ("restart your OpenCode") instead of polling a
+// surface that cannot change.
 import { z } from 'zod';
 
 import { TOKENPANEL_DEFAULT_BASE } from '../tokenpanel/tokenpanel-quota.js';
@@ -83,6 +93,12 @@ const ALCORE_CATALOG_TIMEOUT_MS = 15_000;
 // Only that rejection is retried, briefly — anything else fails fast so a
 // credential outage never holds a proven login hostage.
 const ALCORE_CREDENTIAL_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+// Post-write readiness poll (task 55): the task-54 race lost ~26 s after
+// the writes, so the ceiling clears that with margin while the short
+// interval answers a fast watcher in about a second. Both bounds are
+// injectable on the runtime so tests never sleep.
+const ALCORE_READINESS_TIMEOUT_MS = 30_000;
+const ALCORE_READINESS_INTERVAL_MS = 500;
 // Mirrors the model-capability vocabulary the provider registry validates.
 const ALCORE_KNOWN_CAPABILITIES = new Set(['text', 'image', 'audio', 'video', 'pdf']);
 
@@ -212,10 +228,47 @@ export const createAlcoreProviderRuntime = ({
   // keeps the block-only behavior: the provider block is still written,
   // but no key is minted and no credential is stored.
   personalKeys = null,
-  // Wait between key-method retries (injectable so tests never sleep).
+  // Model-surface probe (task 55 — the post-login race): `() =>
+  // Promise<unknown[]>` resolving the alcore models the managed OpenCode
+  // currently serves (production: `client.model.list()` filtered to the
+  // alcore provider; tests: a recording fake). Null (default) keeps the
+  // write-then-return behavior: no poll, readiness reports ready.
+  listAlcoreModels = null,
+  // Managed-vs-external OpenCode (task 55): an external server never sees
+  // this process's config write, so the poll below would time out by
+  // construction — report `needs_restart` instead. Production reads the
+  // lifecycle's external flag; tests inject a boolean thunk.
+  isExternalOpenCode = () => false,
+  // Bounds for the post-write poll (task 55): ~30 s max so a login that
+  // lands ~26 s after the writes (task-54) resolves ready, short interval
+  // so a fast watcher answers in about a second. Both injectable so tests
+  // never sleep.
+  readinessTimeoutMs = ALCORE_READINESS_TIMEOUT_MS,
+  readinessIntervalMs = ALCORE_READINESS_INTERVAL_MS,
+  // Clock (injectable so timeout tests never sleep).
+  now = () => Date.now(),
+  // Wait between key-method retries and readiness polls (injectable so
+  // tests never sleep).
   credentialWait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   credentialRetryDelaysMs = ALCORE_CREDENTIAL_RETRY_DELAYS_MS,
 } = {}) => {
+  // Post-login readiness (task 55): the single gate the first prompt waits
+  // on. `syncing` while the poll runs, `ready` once the alcore models
+  // resolve on the managed model surface, `syncing_retry` when the bounded
+  // poll times out (send retries on the named state — never the raw
+  // upstream "Provider unavailable"), `needs_restart` on an external
+  // server (this process's write is invisible there — restart OpenCode).
+  // A generation rejects stale completions: concurrent logins and a
+  // sign-out mid-sync bump it, and the poll loop aborts instead of
+  // publishing for a sync that no longer owns the provider.
+  let readinessGeneration = 0;
+  let readiness = { state: 'idle', updatedAt: now(), needsRestart: false };
+  const setReadiness = (state, needsRestart = false) => {
+    readiness = { state, updatedAt: now(), needsRestart };
+  };
+  // Authoritative read for the readiness route and the composer hold.
+  // Never throws, never touches the network: a snapshot, not a probe.
+  const getReadiness = () => ({ ...readiness });
   const readStoredAccess = async (sub) => {
     if (userTokenStore === null || userTokenStore === undefined) return '';
     try {
@@ -364,10 +417,15 @@ export const createAlcoreProviderRuntime = ({
   };
 
   // Best-effort registration after a proven login. Resolves `{ ok: true,
-  // models }` or `{ ok: false, reason }` and NEVER rejects: a catalog
+  // models, ready }` (plus `reason`/`needsRestart` while not ready) or
+  // `{ ok: false, reason }` and NEVER rejects: a catalog
   // outage, a refused token, enterprise mode, a config-write failure, a
   // refused/unreachable personal-key mint, or a credential-sync failure
-  // must not break the login that just succeeded. The credential stored is
+  // must not break the login that just succeeded. After the block +
+  // credential writes it polls the managed model surface for the alcore
+  // entries (bounded ~30 s, task 55) before reporting complete, so the
+  // first prompt finds the provider instead of racing the watcher. The
+  // credential stored is
   // the freshly minted personal API key for the caller's own link (see
   // `./personal-key.js`) — never the rotating login Bearer, never a
   // service or management key, never in config/disk/URL/logs. When the
@@ -419,7 +477,69 @@ export const createAlcoreProviderRuntime = ({
         // written and the card lists live models either way.
       }
       await provisionOpenCodeCredential(credential.key);
-      return { ok: true, models: catalog.models.length };
+      // Readiness gate (task 55): the inference path builds its provider
+      // client from the managed model surface, which lags the config +
+      // credential writes by seconds (task-54: attempt 1 lost ~26 s after
+      // the writes, the retry won). Poll that surface — bounded, never
+      // rejecting — before reporting the sync complete, so the first
+      // prompt after login finds the provider instead of racing it.
+      try {
+        let external = false;
+        try {
+          external = (await isExternalOpenCode()) === true;
+        } catch {
+          external = false;
+        }
+        if (external) {
+          setReadiness('needs_restart', true);
+          return {
+            ok: true, models: catalog.models.length, ready: false, reason: 'external_restart_required', needsRestart: true,
+          };
+        }
+        if (listAlcoreModels === null || listAlcoreModels === undefined) {
+          setReadiness('ready');
+          return { ok: true, models: catalog.models.length, ready: true };
+        }
+        const ownedGeneration = (readinessGeneration += 1);
+        setReadiness('syncing');
+        const timeoutMs = Number.isSafeInteger(readinessTimeoutMs) ? readinessTimeoutMs : ALCORE_READINESS_TIMEOUT_MS;
+        const intervalMs = Number.isSafeInteger(readinessIntervalMs) && readinessIntervalMs > 0
+          ? readinessIntervalMs
+          : ALCORE_READINESS_INTERVAL_MS;
+        const deadline = now() + Math.max(0, timeoutMs);
+        for (;;) {
+          if (ownedGeneration !== readinessGeneration) {
+            return {
+              ok: true, models: catalog.models.length, ready: false, reason: 'superseded',
+            };
+          }
+          let visible = null;
+          try {
+            visible = await listAlcoreModels();
+          } catch {
+            visible = null;
+          }
+          if (Array.isArray(visible) && visible.length > 0) {
+            if (ownedGeneration === readinessGeneration) setReadiness('ready');
+            return { ok: true, models: catalog.models.length, ready: true };
+          }
+          if (now() >= deadline) {
+            if (ownedGeneration === readinessGeneration) setReadiness('syncing_retry');
+            return {
+              ok: true, models: catalog.models.length, ready: false, reason: 'provider_syncing',
+            };
+          }
+          await credentialWait(intervalMs);
+        }
+      } catch {
+        // A probe failure never breaks the login that just succeeded: the
+        // block and credential above stand, and the composer retries on the
+        // named syncing state.
+        setReadiness('syncing_retry');
+        return {
+          ok: true, models: catalog.models.length, ready: false, reason: 'provider_syncing',
+        };
+      }
     } catch (error) {
       console.warn(`[alcore-provider] login sync skipped (${error?.code ?? 'unavailable'})`);
       return { ok: false, reason: error?.code ?? 'unavailable' };
@@ -436,6 +556,11 @@ export const createAlcoreProviderRuntime = ({
   // revoke still proceeds to the local removal, and the next login's
   // rotate-with-revoke-old cleans up any surviving row regardless.
   const clearOnSignOut = async (sub) => {
+    // A sign-out mid-sync retires the running poll: bump the generation so
+    // its loop aborts as superseded, and park the gate at idle so the next
+    // login starts from a known state.
+    readinessGeneration += 1;
+    setReadiness('idle');
     const outcome = { cleared: false, removed: false };
     const id = subSchema.safeParse(sub).data;
     if (id !== undefined && personalKeys !== null && personalKeys !== undefined) {
@@ -482,5 +607,11 @@ export const createAlcoreProviderRuntime = ({
     return outcome;
   };
 
-  return { resolveBase: (explicit) => resolveAlcoreBase(explicit, env), fetchAlcoreCatalog, syncOnLogin, clearOnSignOut };
+  return {
+    resolveBase: (explicit) => resolveAlcoreBase(explicit, env),
+    fetchAlcoreCatalog,
+    syncOnLogin,
+    clearOnSignOut,
+    getReadiness,
+  };
 };

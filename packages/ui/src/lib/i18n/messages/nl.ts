@@ -2622,6 +2622,8 @@ export const dict = {
   'chat.chatInput.toast.attachmentsTooLarge': 'De bijlagen zijn te groot om te verzenden. Verminder het aantal of de grootte van de afbeeldingen.',
   'chat.chatInput.toast.sendAttachmentsFailed': 'Kan de bijlagen niet verzenden. Gebruik minder bestanden of kleinere afbeeldingen.',
   'chat.chatInput.toast.messageSendFailed': 'Bericht kon niet worden verzonden. Bijlagen hersteld.',
+  'chat.alcore.readiness.syncing': 'De Alcore-provider wordt nog gesynchroniseerd. Probeer het zo opnieuw.',
+  'chat.alcore.readiness.restartRequired': 'Start je OpenCode opnieuw om de Alcore-configuratie te voltooien en verzend daarna opnieuw.',
   'chat.chatInput.toast.noModelSelected': 'Kies een provider en model voor het verzenden.',
   'chat.chatInput.toast.clipboardAttachFailed': 'Kan de afbeelding uit het klembord niet toevoegen',
   'chat.chatInput.toast.clipboardTextAttachFailed': 'Kan de geplakte tekst niet als bestand toevoegen',

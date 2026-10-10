@@ -2590,6 +2590,8 @@ export const dict: Record<I18nKey, string> = {
   'chat.chatInput.toast.attachmentsTooLarge': '附件過大，無法傳送。請減少圖片數量或大小。',
   'chat.chatInput.toast.sendAttachmentsFailed': '傳送附件失敗。請嘗試更少檔案或更小圖片。',
   'chat.chatInput.toast.messageSendFailed': '訊息傳送失敗，附件已恢復。',
+  'chat.alcore.readiness.syncing': 'Alcore 提供者仍在同步中，請稍後重試。',
+  'chat.alcore.readiness.restartRequired': '重新啟動 OpenCode 以完成 Alcore 設定，然後重新傳送。',
   'chat.chatInput.toast.noModelSelected': '傳送前請先選擇提供者與模型。',
   'chat.chatInput.toast.clipboardAttachFailed': '從剪貼簿附加圖片失敗',
   'chat.chatInput.toast.clipboardTextAttachFailed': '無法將貼上的文字附加為檔案',

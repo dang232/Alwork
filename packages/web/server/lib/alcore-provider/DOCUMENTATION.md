@@ -56,7 +56,20 @@ link (`POST {origin}/admin/ide/personal-key` with the caller's Bearer via
 stores that SAME minted key as the OpenCode `alcore` integration
 credential (`POST /api/integration/alcore/connect/key` — the exact path
 the Settings API-key save uses), sweeping stale entries first so one
-login never accumulates accounts. The credential is a real customer API
+login never accumulates accounts. Then the readiness gate (task 55): polls
+the managed OpenCode model surface (`client.model.list()` filtered to the
+alcore provider) for the alcore entries — bounded ~30 s at a short
+interval — before reporting the sync complete, so the first prompt after
+login finds the provider instead of racing the config watcher (task 54:
+the first attempt lost ~26 s after the writes). The gate is published at
+`getReadiness()` (`idle` → `syncing` → `ready`; `syncing_retry` when the
+bounded poll times out; `needs_restart` on an external server, which
+never sees this process's write) and served at `GET /api/alcore/readiness`
+for the composer hold in `opencodeClient.sendMessage`, which waits on it
+for alcore sends and otherwise fails fast with the named syncing/restart
+state instead of the raw upstream "Provider unavailable". A concurrent
+login or a sign-out mid-sync retires the running poll (generation): the
+loser reports `superseded` and the gate parks at `idle` on sign-out. The credential is a real customer API
 key, never the rotating login token: login-token rotation/expiry cannot
 touch it. An empty or malformed catalog skips the write — never an empty
 model list. A refused or unreachable mint still keeps the block write but
@@ -93,8 +106,17 @@ without a restart.
 - `createAlcoreProviderRuntime({ userTokenStore, upsertProviderConfig,
   removeProviderConfig, serviceFetch, env, isEnterprise,
   openCodeCredentials, personalKeys, credentialWait,
-  credentialRetryDelaysMs })`:
-  `{ resolveBase, fetchAlcoreCatalog, syncOnLogin, clearOnSignOut }`.
+  credentialRetryDelaysMs, listAlcoreModels, isExternalOpenCode,
+  readinessTimeoutMs, readinessIntervalMs, now })`:
+  `{ resolveBase, fetchAlcoreCatalog, syncOnLogin, clearOnSignOut,
+  getReadiness }`.
+  `listAlcoreModels` (`() => Promise<unknown[]>`, the alcore models the
+  running OpenCode serves — null keeps the write-then-return behavior),
+  `isExternalOpenCode` (`() => boolean`, the lifecycle's external flag —
+  an external server reports `needs_restart` instead of polling), and the
+  poll bounds/clock are all injectable so tests never sleep.
+  `getReadiness()` returns the `{ state, updatedAt, needsRestart }`
+  snapshot the `GET /api/alcore/readiness` route serves.
   Every option is injectable; production passes the shared keychain
   singleton, the real provider registry, the real `@opencode/client`
   credential calls (global client, no directory — the Settings save path),

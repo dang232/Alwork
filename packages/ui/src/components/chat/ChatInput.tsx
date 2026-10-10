@@ -31,6 +31,7 @@ import { useSnippetsStore } from '@/stores/useSnippetsStore';
 import { renderMagicPrompt } from '@/lib/magicPrompts';
 import { startReviewFlow } from '@/lib/reviewFlow';
 import { getRuntimeKey, subscribeRuntimeEndpointWillChange } from '@/lib/runtime-switch';
+import { isAlcoreReadinessError, isAlcoreRestartRequiredError } from '@/lib/alcore/alcoreReadiness';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import {
     createChatDraftIdentity,
@@ -1517,6 +1518,11 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
     }, []);
 
     const getSubmitErrorMessage = (error: unknown, fallback: string) => {
+        // Post-login readiness (task 55): the hold throws named codes, not
+        // the raw upstream "Provider unavailable" — render the translated
+        // guidance the gate names.
+        if (isAlcoreRestartRequiredError(error)) return t('chat.alcore.readiness.restartRequired');
+        if (isAlcoreReadinessError(error)) return t('chat.alcore.readiness.syncing');
         const message = error instanceof Error ? error.message : '';
         return message.toLowerCase().includes('runtime changed')
             ? t('chat.chatInput.toast.messageSendFailed')

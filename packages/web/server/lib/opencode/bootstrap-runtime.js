@@ -82,6 +82,11 @@ export const createBootstrapRuntime = (dependencies) => {
       // both move across an OpenCode restart.
       buildOpenCodeUrl = null,
       getOpenCodeAuthHeaders = null,
+      // Managed-vs-external OpenCode (task 55): an external server never
+      // sees this process's config write, so the readiness poll would time
+      // out by construction — the sync reports `needs_restart` instead.
+      // Optional (tests omit it): without it the sync assumes managed.
+      isExternalOpenCode = null,
     } = options;
 
     const uiAuthController = createUiAuth({
@@ -175,12 +180,31 @@ export const createBootstrapRuntime = (dependencies) => {
           : undefined,
       }),
     });
+    // Readiness probe (task 55 — the post-login race): the alcore models
+    // the running OpenCode currently serves, read per call through the
+    // same global client the credential calls use. Unwired keeps the
+    // write-then-return behavior (no poll, readiness reports ready).
+    const listAlcoreModels = openCodeWired
+      ? async () => {
+        const client = OpenCode.make({
+          baseUrl: buildOpenCodeUrl('', '').replace(/\/+$/, ''),
+          headers: { ...getOpenCodeAuthHeaders() },
+        });
+        const { data } = await client.model.list();
+        return (Array.isArray(data) ? data : [])
+          .filter((entry) => entry?.providerID === ALCORE_PROVIDER_ID);
+      }
+      : null;
     const alcoreProvider = createAlcoreProviderRuntime({
       userTokenStore: sharedUserTokenStore(),
       upsertProviderConfig,
       removeProviderConfig,
       openCodeCredentials,
       personalKeys,
+      listAlcoreModels,
+      // Null (tests, unwired runtimes) falls back to the runtime default:
+      // the sync assumes a managed server and reports ready unwired.
+      isExternalOpenCode: isExternalOpenCode ?? (() => false),
     });
 
     const authAndAccessRoutes = registerAuthAndAccessRoutes(app, {

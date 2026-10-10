@@ -1417,6 +1417,8 @@ export const dict: Record<I18nKey, string> = {
   'chat.chatInput.toast.forkNothingToFork': 'Nie ma jeszcze czego rozgałęzić: w tej sesji nie zakończyła się żadna odpowiedź',
   'chat.chatInput.toast.forkSendFailed': 'Rozgałęziono, ale wiadomość nie została wysłana. Wróciła do pola wpisywania.',
   'chat.chatInput.toast.messageSendFailed': 'Nie udało się wysłać wiadomości. Załączniki zostały przywrócone.',
+  'chat.alcore.readiness.syncing': 'Dostawca Alcore jest wciąż synchronizowany. Spróbuj ponownie za chwilę.',
+  'chat.alcore.readiness.restartRequired': 'Uruchom ponownie OpenCode, aby dokończyć konfigurację Alcore, a następnie wyślij ponownie.',
   'chat.chatInput.toast.noModelSelected': 'Wybierz dostawcę i model przed wysłaniem.',
   'chat.chatInput.toast.openSessionFirst': 'Najpierw otwórz sesję',
   'chat.chatInput.toast.dictationKeptForOriginalSession': 'Dyktowanie zapisano jako szkic w sesji, w której je rozpoczęto',

@@ -104,6 +104,11 @@ const createHarness = ({
   openCodeCredentials = null,
   personalKeys = 'memory',
   credentialWait = async () => undefined,
+  listAlcoreModels = null,
+  isExternalOpenCode = () => false,
+  readinessTimeoutMs = undefined,
+  readinessIntervalMs = undefined,
+  now = undefined,
 } = {}) => {
   const requests = [];
   const serviceFetch = async (url, init) => {
@@ -139,6 +144,11 @@ const createHarness = ({
     openCodeCredentials: openCode,
     personalKeys: personal,
     credentialWait,
+    listAlcoreModels,
+    isExternalOpenCode,
+    readinessTimeoutMs,
+    readinessIntervalMs,
+    now,
   });
   return { runtime, requests, upserts, removals, env, store, openCode, personalKeys: personal };
 };
@@ -252,7 +262,7 @@ describe('alcore login sync', () => {
   test('registers the provider through the shared registry with live models', async () => {
     const { runtime, upserts, env, personalKeys } = createHarness();
     const outcome = await runtime.syncOnLogin('user-1');
-    expect(outcome).toEqual({ ok: true, models: 2 });
+    expect(outcome).toEqual({ ok: true, models: 2, ready: true });
     expect(upserts).toHaveLength(1);
     const [providerId, config, workingDirectory, scope, options] = upserts[0];
     expect(providerId).toBe(ALCORE_PROVIDER_ID);
@@ -337,7 +347,7 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
     const openCode = memoryOpenCodeCredentials();
     const { runtime, upserts } = createHarness({ openCodeCredentials: openCode });
     const outcome = await runtime.syncOnLogin('user-1');
-    expect(outcome).toEqual({ ok: true, models: 2 });
+    expect(outcome).toEqual({ ok: true, models: 2, ready: true });
     expect(upserts).toHaveLength(1);
     // The minted customer API key powers the credential: never the rotating
     // login Bearer, never a service key, never from config, never in a URL.
@@ -348,7 +358,7 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
   test('sweeps stale credentials first so one login never accumulates accounts', async () => {
     const openCode = memoryOpenCodeCredentials({ existingIds: ['cred-old-1', 'cred-old-2'] });
     const { runtime } = createHarness({ openCodeCredentials: openCode });
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
     expect(openCode.calls.removed).toEqual(['cred-old-1', 'cred-old-2']);
     expect(openCode.calls.connected).toEqual(['personal-key-1']);
   });
@@ -369,7 +379,7 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
     });
     // Login-token rotation must not affect the stored provider key: the
     // credential is the minted key even though the catalog Bearer rotated.
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
     expect(openCode.calls.connected).toEqual(['personal-key-1']);
   });
 
@@ -387,7 +397,7 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
       openCodeCredentials: openCode,
       credentialWait: async (ms) => { waited.push(ms); },
     });
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
     expect(attempts).toBe(2);
     expect(waited).toEqual([250]);
     expect(openCode.calls.connected).toEqual(['personal-key-1']);
@@ -398,14 +408,14 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
       connectImpl: async () => { throw Object.assign(new Error('openCode down'), { code: 'unavailable' }); },
     });
     const { runtime, upserts, env } = createHarness({ openCodeCredentials: openCode });
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
     expect(upserts).toHaveLength(1);
     expect(env[ALCORE_ENV_CREDENTIAL]).toBe('personal-key-1');
   });
 
   test('unwired OpenCode keeps the task-42 block-only behavior', async () => {
     const { runtime } = createHarness();
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
   });
 
   test('enterprise mode skips credential work without store, mint, or network calls', async () => {
@@ -500,8 +510,8 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
       },
     });
     const { runtime, env } = createHarness({ openCodeCredentials: openCode, personalKeys });
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
-    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2 });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
     expect(personalKeys.calls.minted).toEqual(['user-1', 'user-1']);
     // The stored credential is always a minted key — a login Bearer never
     // lands there, so rotation/expiry of login tokens cannot touch it.
@@ -550,6 +560,126 @@ describe('alcore OpenCode credential sync (task 48 — badge flip, task 51 — p
     personalKeys.keyIds.set('user-1', 'key-id-9');
     await expect(runtime.clearOnSignOut('user-1')).resolves.toEqual({ cleared: true, removed: true });
     expect(personalKeys.calls.revoked).toEqual([['user-1', 'key-id-9']]);
+  });
+});
+
+describe('alcore login readiness gate (task 55 — first prompt waits on the model surface)', () => {
+  test('a slow watcher resolves ready once the alcore entries land', async () => {
+    const waited = [];
+    let probes = 0;
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => {
+        probes += 1;
+        return probes >= 3 ? [{ modelID: 'al-1-3-max' }] : [];
+      },
+      credentialWait: async (ms) => { waited.push(ms); },
+    });
+    const outcome = await runtime.syncOnLogin('user-1');
+    expect(outcome).toEqual({ ok: true, models: 2, ready: true });
+    expect(probes).toBe(3);
+    expect(waited).toEqual([500, 500]);
+    expect(runtime.getReadiness()).toMatchObject({ state: 'ready', needsRestart: false });
+  });
+
+  test('an immediately visible surface resolves without waiting', async () => {
+    const waited = [];
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => [{ modelID: 'al-1-3-max' }],
+      credentialWait: async (ms) => { waited.push(ms); },
+    });
+    expect(await runtime.syncOnLogin('user-1')).toEqual({ ok: true, models: 2, ready: true });
+    expect(waited).toHaveLength(0);
+    expect(runtime.getReadiness().state).toBe('ready');
+  });
+
+  test('a watcher that never picks up fails fast with the named syncing state', async () => {
+    const waited = [];
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => [],
+      readinessTimeoutMs: 0,
+      credentialWait: async (ms) => { waited.push(ms); },
+    });
+    const outcome = await runtime.syncOnLogin('user-1');
+    expect(outcome).toEqual({ ok: true, models: 2, ready: false, reason: 'provider_syncing' });
+    expect(waited).toHaveLength(0);
+    expect(runtime.getReadiness()).toMatchObject({ state: 'syncing_retry', needsRestart: false });
+  });
+
+  test('a probe failure reads as syncing, never a broken login', async () => {
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => { throw new Error('openCode down'); },
+      readinessTimeoutMs: 0,
+    });
+    const outcome = await runtime.syncOnLogin('user-1');
+    expect(outcome).toEqual({ ok: true, models: 2, ready: false, reason: 'provider_syncing' });
+    expect(runtime.getReadiness().state).toBe('syncing_retry');
+  });
+
+  test('an external server reports restart guidance without polling', async () => {
+    let probed = 0;
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => { probed += 1; return []; },
+      isExternalOpenCode: () => true,
+    });
+    const outcome = await runtime.syncOnLogin('user-1');
+    expect(outcome).toEqual({
+      ok: true, models: 2, ready: false, reason: 'external_restart_required', needsRestart: true,
+    });
+    expect(probed).toBe(0);
+    expect(runtime.getReadiness()).toMatchObject({ state: 'needs_restart', needsRestart: true });
+  });
+
+  test('a sign-out mid-sync retires the running poll at idle', async () => {
+    let releaseFirst = () => {};
+    const firstGate = new Promise((resolve) => { releaseFirst = () => resolve([]); });
+    let polls = 0;
+    let firstPolledResolve = () => {};
+    const firstPolled = new Promise((resolve) => { firstPolledResolve = () => resolve(); });
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => {
+        polls += 1;
+        if (polls === 1) {
+          firstPolledResolve();
+          return firstGate;
+        }
+        return [];
+      },
+      readinessTimeoutMs: 30_000,
+    });
+    const pending = runtime.syncOnLogin('user-1');
+    await firstPolled;
+    await runtime.clearOnSignOut('user-1');
+    releaseFirst();
+    const outcome = await pending;
+    expect(outcome).toEqual({ ok: true, models: 2, ready: false, reason: 'superseded' });
+    expect(runtime.getReadiness().state).toBe('idle');
+  });
+
+  test('concurrent logins settle exactly once: the loser reads superseded', async () => {
+    let releaseFirst = () => {};
+    const firstGate = new Promise((resolve) => { releaseFirst = () => resolve([]); });
+    let polls = 0;
+    let firstPolledResolve = () => {};
+    const firstPolled = new Promise((resolve) => { firstPolledResolve = () => resolve(); });
+    const { runtime } = createHarness({
+      listAlcoreModels: async () => {
+        polls += 1;
+        if (polls === 1) {
+          firstPolledResolve();
+          return firstGate;
+        }
+        return [{ modelID: 'al-1-3-max' }];
+      },
+      readinessTimeoutMs: 30_000,
+    });
+    const pending = runtime.syncOnLogin('user-1');
+    await firstPolled;
+    const secondOutcome = await runtime.syncOnLogin('user-1');
+    releaseFirst();
+    const firstOutcome = await pending;
+    expect(secondOutcome).toEqual({ ok: true, models: 2, ready: true });
+    expect(firstOutcome).toEqual({ ok: true, models: 2, ready: false, reason: 'superseded' });
+    expect(runtime.getReadiness().state).toBe('ready');
   });
 });
 

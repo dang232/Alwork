@@ -705,6 +705,37 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     post: (path, ...handlers) => app.post(path, ...handlers),
   }, { express, tunnelAuthController });
 
+  // Alcore readiness gate (task 55): the composer hold reads this before
+  // the first alcore send. A snapshot of the login sync's model-surface
+  // poll — never a probe, never a secret, so no auth gate beyond the
+  // surrounding app applies. Unwired (tests, runtimes without the provider
+  // wiring) answers idle so a send never blocks on a gate that does not
+  // exist here. Registered here (not in the status routes) because the
+  // provider runtime arrives with these dependencies.
+  app.get('/api/alcore/readiness', async (_req, res) => {
+    // A snapshot, never a probe: the only secret-adjacent value here is
+    // none — state enum plus restart hint, safe to serve as-is.
+    const unreadable = { state: 'idle', needsRestart: false };
+    try {
+      const snapshot = await alcoreProvider?.getReadiness?.();
+      const state = snapshot?.state;
+      if (
+        state === 'idle'
+        || state === 'syncing'
+        || state === 'ready'
+        || state === 'syncing_retry'
+        || state === 'needs_restart'
+      ) {
+        res.json({ state, needsRestart: snapshot?.needsRestart === true });
+        return;
+      }
+      res.json(unreadable);
+      return;
+    } catch {
+      res.json(unreadable);
+    }
+  });
+
   app.post('/auth/url-token', async (req, res, next) => {
     try {
       await uiAuthController.handleUrlAuthToken(req, res);

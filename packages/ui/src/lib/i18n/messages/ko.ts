@@ -2622,6 +2622,8 @@ export const dict: Record<I18nKey, string> = {
   'chat.chatInput.toast.attachmentsTooLarge': '첨부 파일이 너무 커서 보낼 수 없습니다. 이미지 수나 크기를 줄여 보세요.',
   'chat.chatInput.toast.sendAttachmentsFailed': '첨부 파일 전송 실패. 파일 수나 이미지 크기를 줄여 보세요.',
   'chat.chatInput.toast.messageSendFailed': '메시지 전송에 실패했습니다. 첨부 파일을 복원했습니다.',
+  'chat.alcore.readiness.syncing': 'Alcore 제공자가 아직 동기화 중입니다. 잠시 후 다시 시도하세요.',
+  'chat.alcore.readiness.restartRequired': 'Alcore 설정을 완료하려면 OpenCode를 다시 시작한 뒤 다시 보내세요.',
   'chat.chatInput.toast.noModelSelected': '전송하기 전에 제공업체와 모델을 선택하세요.',
   'chat.chatInput.toast.clipboardAttachFailed': '클립보드 이미지 첨부 실패',
   'chat.chatInput.toast.clipboardTextAttachFailed': '붙여넣은 텍스트를 파일로 첨부하지 못했습니다',

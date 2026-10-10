@@ -2304,8 +2304,13 @@ async function main(options = {}) {
     // Alcore badge flip (task 48): the provider runtime stores the caller's
     // own keychained Bearer as the OpenCode `alcore` credential on login
     // and removes it on sign-out. Read per call — port/password move.
+    // Task 55 passes the managed/external flag the same way: an external
+    // server never sees this process's config write, so the readiness gate
+    // reports `needs_restart` instead of polling a surface that cannot
+    // change. Read per call — the flag flips when the OpenCode target does.
     buildOpenCodeUrl,
     getOpenCodeAuthHeaders,
+    isExternalOpenCode: () => isExternalOpenCode,
   });
   uiAuthController = bootstrapResult.uiAuthController;
   // After the API auth gate, before every route that reads a directory, before the OpenCode proxy.

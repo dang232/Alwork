@@ -36,6 +36,7 @@ import { getRuntimeKey } from "@/lib/runtime-switch"
 import { getRegisteredRuntimeAPIs } from "@/contexts/runtimeAPIRegistry"
 import { markStartupTrace } from "@/lib/startupTrace"
 import { assertProviderCircuitClosed, recordProviderError, recordProviderSuccess } from "./provider-tracker"
+import { ensureAlcoreProviderReady } from "@/lib/alcore/alcoreReadiness"
 import { normalizePath } from "@/lib/pathNormalization"
 import { isAutoModel } from "@/lib/routing/autoModel"
 import { activeSessionSnapshotSchema, hostSessionStatusSnapshotSchema, type HostSessionStatusSnapshot } from "./session-status"
@@ -1169,6 +1170,11 @@ class OpencodeService {
       throw new Error("Message must have at least one part (text or file)")
     }
 
+    // Post-login readiness (task 55): hold the first alcore prompt on the
+    // login sync's model-surface poll instead of racing it. Non-alcore
+    // providers and an unreadable gate send at once.
+    await ensureAlcoreProviderReady(params.providerID)
+
     assertProviderCircuitClosed(params.providerID)
 
     const admitSynthetic = async (item: SyntheticContextInput) => {
@@ -1253,6 +1259,9 @@ class OpencodeService {
     directory?: string | null
   }): Promise<void> {
     this.assertRuntimeUnchanged(params.runtimeKey)
+    // Same post-login hold as a prompt (task 55): a slash command still
+    // runs the session's model, so an alcore command waits on the gate too.
+    await ensureAlcoreProviderReady(params.model?.providerID ?? "")
     const files = await Promise.all((params.files ?? []).map((file) => this.toPromptFile(file)))
     await this.applySendSelection(params.id, { model: params.model, agent: params.agent }, params.directory, params.runtimeKey)
     for (const item of params.context ?? []) {

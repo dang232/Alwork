@@ -2444,6 +2444,8 @@ export const dict = {
   'chat.chatInput.toast.attachmentsTooLarge': 'Ekler gönderilemeyecek kadar büyük. Görsel sayısını veya boyutunu azaltmayı dene.',
   'chat.chatInput.toast.sendAttachmentsFailed': 'Ekler gönderilemedi. Daha az dosya veya daha küçük görseller deneyin.',
   'chat.chatInput.toast.messageSendFailed': 'Mesaj gönderilemedi. Ekler geri yüklendi.',
+  'chat.alcore.readiness.syncing': 'Alcore sağlayıcısı hâlâ eşitleniyor. Birazdan yeniden deneyin.',
+  'chat.alcore.readiness.restartRequired': 'Alcore kurulumunu tamamlamak için OpenCode\'u yeniden başlatıp tekrar gönderin.',
   'chat.chatInput.toast.clipboardAttachFailed': 'Panodan görsel eklenemedi',
   'chat.chatInput.toast.clipboardTextAttachFailed': 'Yapıştırılan metin dosya olarak eklenemedi',
   'chat.chatInput.toast.largeTextPaste.title': 'Büyük metin algılandı',
